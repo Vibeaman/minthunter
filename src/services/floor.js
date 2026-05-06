@@ -136,51 +136,56 @@ async function checkAlerts(db, bot) {
 }
 
 /**
- * Get trending collections (top by volume)
- * Uses CoinGecko NFT API as primary (more reliable)
+ * Get trending collections (top NFTs)
+ * Fetches individual popular collections from CoinGecko
  */
 async function getTrending() {
-  // Try CoinGecko first (more reliable)
-  try {
-    const data = await fetchJson(
-      'https://api.coingecko.com/api/v3/nfts/markets?order=volume_24h_desc&per_page=10'
-    )
-    
-    if (data && Array.isArray(data) && data.length > 0) {
-      return data.map(c => ({
-        name: c.name || 'Unknown',
-        floor: c.floor_price?.native_currency || 0,
-        floorUsd: c.floor_price?.usd || 0,
-        volume24h: c.volume_24h?.native_currency || 0,
-        change24h: c.floor_price_24h_percentage_change || 0,
-        address: c.contract_address
-      }))
+  // Top NFT collection IDs on CoinGecko (curated list)
+  const topCollections = [
+    'bored-ape-yacht-club',
+    'cryptopunks',
+    'mutant-ape-yacht-club',
+    'azuki',
+    'pudgy-penguins',
+    'milady-maker',
+    'doodles-official',
+    'clonex',
+    'degods-solana', 
+    'moonbirds'
+  ]
+  
+  const results = []
+  
+  for (const id of topCollections) {
+    try {
+      const data = await fetchJson(
+        `https://api.coingecko.com/api/v3/nfts/${id}`
+      )
+      
+      if (data && data.name) {
+        results.push({
+          name: data.name || 'Unknown',
+          floor: data.floor_price?.native_currency || 0,
+          floorUsd: data.floor_price?.usd || 0,
+          volume24h: data.volume_24h?.native_currency || 0,
+          change24h: data.floor_price_24h_percentage_change?.native_currency || 0,
+          address: data.contract_address
+        })
+      }
+      
+      // Rate limit - CoinGecko free tier is 10-30 req/min
+      await sleep(350)
+      
+    } catch (e) {
+      console.log(`Failed to fetch ${id}:`, e.message)
+      continue
     }
-  } catch (e) {
-    console.log('CoinGecko trending error:', e.message)
   }
   
-  // Fallback to Reservoir
-  try {
-    const data = await fetchJson(
-      'https://api.reservoir.tools/collections/v6?sortBy=1DayVolume&limit=10'
-    )
-    
-    if (data?.collections) {
-      return data.collections.map(c => ({
-        name: c.name || 'Unknown',
-        floor: c.floorAsk?.price?.amount?.native || 0,
-        floorUsd: c.floorAsk?.price?.amount?.usd || 0,
-        volume24h: c.volume?.['1day'] || 0,
-        change24h: c.floorSaleChange?.['1day'] || 0,
-        address: c.primaryContract || c.id
-      }))
-    }
-  } catch (e) {
-    console.log('Reservoir trending error:', e.message)
-  }
+  // Sort by 24h volume descending
+  results.sort((a, b) => (b.volume24h || 0) - (a.volume24h || 0))
   
-  return []
+  return results
 }
 
 // Helper: fetch JSON
