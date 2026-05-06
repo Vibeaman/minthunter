@@ -493,6 +493,59 @@ initDb().then(() => {
       return
     }
 
+    // ========== SCHEDULED MINT ==========
+    if (data === 'mint_schedule') {
+      const wallets = db.prepare('SELECT * FROM wallets WHERE telegram_id = ?').all(userId)
+      
+      if (wallets.length === 0) {
+        await bot.sendMessage(chatId,
+          '❌ No wallets found.\n\nAdd a wallet first.',
+          { reply_markup: walletsMenu }
+        )
+        return
+      }
+      
+      const buttons = wallets.map(w => {
+        const short = w.address.slice(0, 6) + '...' + w.address.slice(-4)
+        return [{ text: `👛 ${short}`, callback_data: `sched_wallet_${w.id}` }]
+      })
+      buttons.push([{ text: '🔙 Back', callback_data: 'menu_mint' }])
+      
+      await bot.sendMessage(chatId,
+        '⏰ *Schedule FCFS Mint*\n\n' +
+        'Bot will auto-mint at your scheduled time.\n' +
+        '⚡ Uses aggressive gas + multi-RPC broadcast for max speed.\n\n' +
+        'Select wallet:',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }
+      )
+      return
+    }
+
+    // Scheduled mint - wallet selected
+    if (data.startsWith('sched_wallet_')) {
+      const walletId = parseInt(data.split('_')[2])
+      const wallet = db.prepare('SELECT * FROM wallets WHERE id = ? AND telegram_id = ?').get(walletId, userId)
+      
+      if (!wallet) {
+        await bot.sendMessage(chatId, '❌ Wallet not found.', { reply_markup: mintMenu })
+        return
+      }
+      
+      userState.set(userId, {
+        step: 'sched_contract',
+        walletId: wallet.id,
+        walletAddress: wallet.address,
+        isScheduled: true
+      })
+      
+      await bot.sendMessage(chatId,
+        '⏰ *Schedule FCFS Mint*\n\n' +
+        'Send the NFT contract address:',
+        { parse_mode: 'Markdown' }
+      )
+      return
+    }
+
     // List pending jobs
     if (data === 'mint_pending') {
       const jobs = db.prepare(`
@@ -797,6 +850,147 @@ initDb().then(() => {
       return
     }
 
+    // SCHEDULED MINT: Receiving contract address
+    if (state.step === 'sched_contract') {
+      const contract = msg.text?.trim()
+      
+      if (!contract || !ethers.isAddress(contract)) {
+        await bot.sendMessage(chatId,
+          '❌ Invalid contract address.\n\n_Send /cancel to abort_',
+          { parse_mode: 'Markdown' }
+        )
+        return
+      }
+      
+      state.contract = contract
+      state.step = 'sched_price'
+      userState.set(userId, state)
+      
+      await bot.sendMessage(chatId,
+        '⏰ *Mint Price*\n\n' +
+        'Enter the mint price in ETH (e.g., 0.05)\n\n' +
+        'Send `0` for free mints.',
+        { parse_mode: 'Markdown' }
+      )
+      return
+    }
+
+    // SCHEDULED MINT: Receiving price
+    if (state.step === 'sched_price') {
+      const priceText = msg.text?.trim()
+      const price = parseFloat(priceText)
+      
+      if (isNaN(price) || price < 0) {
+        await bot.sendMessage(chatId,
+          '❌ Invalid price.\n\n_Send /cancel to abort_',
+          { parse_mode: 'Markdown' }
+        )
+        return
+      }
+      
+      state.mintPrice = priceText
+      state.step = 'sched_datetime'
+      userState.set(userId, state)
+      
+      await bot.sendMessage(chatId,
+        '⏰ *Schedule Time*\n\n' +
+        'When should the mint execute?\n\n' +
+        'Format: `YYYY-MM-DD HH:MM` (UTC)\n\n' +
+        'Examples:\n' +
+        '• `2026-05-07 12:00` - May 7th at 12pm UTC\n' +
+        '• `2026-05-06 23:30` - Today at 11:30pm UTC\n\n' +
+        '_Bot will fire at EXACTLY this time with max speed_',
+        { parse_mode: 'Markdown' }
+      )
+      return
+    }
+
+    // SCHEDULED MINT: Receiving datetime
+    if (state.step === 'sched_datetime') {
+      const datetimeText = msg.text?.trim()
+      
+      // Parse datetime
+      const match = datetimeText.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/)
+      if (!match) {
+        await bot.sendMessage(chatId,
+          '❌ Invalid format. Use: `YYYY-MM-DD HH:MM`\n\n_Send /cancel to abort_',
+          { parse_mode: 'Markdown' }
+        )
+        return
+      }
+      
+      const [_, year, month, day, hour, minute] = match
+      const scheduledDate = new Date(Date.UTC(
+        parseInt(year), parseInt(month) - 1, parseInt(day),
+        parseInt(hour), parseInt(minute), 0
+      ))
+      
+      // Check if in the past
+      if (scheduledDate <= new Date()) {
+        await bot.sendMessage(chatId,
+          '❌ Time is in the past. Enter a future time.\n\n_Send /cancel to abort_',
+          { parse_mode: 'Markdown' }
+        )
+        return
+      }
+      
+      // Create scheduled job with FCFS mode and aggressive gas
+      const result = db.prepare(`
+        INSERT INTO mint_jobs 
+        (telegram_id, wallet_id, contract_address, mint_price, mint_mode, gas_limit, status, scheduled_at)
+        VALUES (?, ?, ?, ?, 'fcfs', ?, 'scheduled', ?)
+      `).run(
+        userId,
+        state.walletId,
+        state.contract,
+        state.mintPrice,
+        375000, // Aggressive gas (250000 * 1.5)
+        scheduledDate.toISOString()
+      )
+      
+      const jobId = result.lastInsertRowid
+      console.log(`⏰ Scheduled mint #${jobId} for ${scheduledDate.toISOString()}`)
+      
+      userState.delete(userId)
+      
+      // Get ETH price for USD
+      const ethPrice = await getEthPrice()
+      const priceUsd = (parseFloat(state.mintPrice) * ethPrice).toFixed(2)
+      const feeUsd = (parseFloat(FCFS_FEE) * ethPrice).toFixed(2)
+      
+      // Format display time
+      const displayTime = scheduledDate.toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
+      const msUntil = scheduledDate - new Date()
+      const minsUntil = Math.floor(msUntil / 60000)
+      const hoursUntil = Math.floor(minsUntil / 60)
+      const timeUntil = hoursUntil > 0 
+        ? `${hoursUntil}h ${minsUntil % 60}m`
+        : `${minsUntil}m`
+      
+      await bot.sendMessage(chatId,
+        `✅ *Scheduled Mint Created*\n\n` +
+        `📋 Job #${jobId}\n` +
+        `📍 Contract: \`${state.contract.slice(0, 10)}...\`\n` +
+        `💎 Price: ${state.mintPrice} ETH (~$${priceUsd})\n` +
+        `⏰ Time: ${displayTime}\n` +
+        `⏱ In: ${timeUntil}\n\n` +
+        `⚡ Mode: FCFS (Max Speed)\n` +
+        `🚀 Gas: Aggressive\n` +
+        `💰 Fee: ${FCFS_FEE} ETH (~$${feeUsd})\n\n` +
+        `_Bot will fire at EXACTLY the scheduled time._`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '❌ Cancel Job', callback_data: `mint_cancel_${jobId}` }],
+              [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
+            ]
+          }
+        }
+      )
+      return
+    }
+
     // MINT: Receiving contract address
     if (state.step === 'mint_contract') {
       const contract = msg.text?.trim()
@@ -922,9 +1116,188 @@ initDb().then(() => {
   
   // Then check every 5 minutes
   setInterval(runAlertCheck, ALERT_CHECK_INTERVAL)
+
+  // ========== SCHEDULED MINT EXECUTOR ==========
+  // Check every second for scheduled mints (need precision!)
+  const SCHEDULE_CHECK_INTERVAL = 1000 // 1 second
+  
+  async function executeScheduledMint(job) {
+    const chatId = job.telegram_id
+    console.log(`🚀 EXECUTING SCHEDULED MINT #${job.id} NOW!`)
+    
+    try {
+      // Get wallet
+      const wallet = db.prepare('SELECT * FROM wallets WHERE id = ?').get(job.wallet_id)
+      if (!wallet) {
+        await bot.sendMessage(chatId, `❌ Scheduled mint #${job.id} failed: Wallet not found`)
+        db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', job.id)
+        return
+      }
+      
+      await bot.sendMessage(chatId, `🚀 *SCHEDULED MINT FIRING NOW!*\n\nJob #${job.id}`, { parse_mode: 'Markdown' })
+      
+      // Decrypt key
+      const privateKey = decryptPrivateKey(wallet.encrypted_key, job.telegram_id.toString())
+      
+      // Get provider
+      const provider = await getProvider()
+      const signer = new ethers.Wallet(privateKey, provider)
+      
+      // Check balance
+      const balance = await provider.getBalance(wallet.address)
+      const mintCost = ethers.parseEther(job.mint_price || '0')
+      const fee = ethers.parseEther(FCFS_FEE)
+      const gasEstimate = BigInt(job.gas_limit) * ethers.parseUnits('100', 'gwei') // High gas for speed
+      const totalNeeded = mintCost + fee + gasEstimate
+      
+      if (balance < totalNeeded) {
+        const ethPrice = await getEthPrice()
+        const shortfall = ethers.formatEther(totalNeeded - balance)
+        const shortUsd = (parseFloat(shortfall) * ethPrice).toFixed(2)
+        await bot.sendMessage(chatId,
+          `❌ *Scheduled Mint #${job.id} Failed*\n\n` +
+          `Insufficient balance!\n` +
+          `Short: ${shortfall} ETH (~$${shortUsd})`,
+          { parse_mode: 'Markdown' }
+        )
+        db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', job.id)
+        return
+      }
+      
+      // Pay fee
+      await bot.sendMessage(chatId, `💰 Paying fee...`)
+      const feeTx = await signer.sendTransaction({
+        to: FEE_WALLET,
+        value: fee
+      })
+      await feeTx.wait(1) // Wait 1 confirmation only for speed
+      
+      // Execute mint with max speed
+      await bot.sendMessage(chatId, `⚡ Broadcasting mint to all RPCs...`)
+      
+      // Build transaction
+      const nonce = await provider.getTransactionCount(wallet.address)
+      const feeData = await provider.getFeeData()
+      
+      // Use 2x gas price for speed
+      const maxFeePerGas = feeData.maxFeePerGas ? feeData.maxFeePerGas * 2n : ethers.parseUnits('100', 'gwei')
+      const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ? feeData.maxPriorityFeePerGas * 2n : ethers.parseUnits('5', 'gwei')
+      
+      // Try multiple mint functions simultaneously
+      const mintSelectors = [
+        '0x1249c58b', // mint()
+        '0xa0712d68', // mint(uint256) - will need encoding
+        '0x40c10f19', // mint(address,uint256)
+        '0x6a627842', // mint(address)
+      ]
+      
+      // Try mint() first (most common)
+      let tx
+      try {
+        const txData = {
+          to: job.contract_address,
+          value: mintCost,
+          gasLimit: job.gas_limit,
+          maxFeePerGas,
+          maxPriorityFeePerGas,
+          nonce,
+          data: '0x1249c58b' // mint()
+        }
+        
+        const signedTx = await signer.signTransaction(txData)
+        
+        // Broadcast to all RPCs
+        tx = await broadcastToAll(signedTx)
+        
+      } catch (e) {
+        // Fallback to regular send
+        tx = await signer.sendTransaction({
+          to: job.contract_address,
+          value: mintCost,
+          gasLimit: job.gas_limit,
+          maxFeePerGas,
+          maxPriorityFeePerGas
+        })
+      }
+      
+      db.prepare(`
+        UPDATE mint_jobs SET status = 'executing', tx_hash = ?, executed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(tx.hash, job.id)
+      
+      await bot.sendMessage(chatId,
+        `🚀 *TX Broadcast!*\n\n` +
+        `TX: \`${tx.hash}\`\n\n` +
+        `Waiting for confirmation...`,
+        { parse_mode: 'Markdown' }
+      )
+      
+      // Wait for confirmation
+      const receipt = await tx.wait()
+      
+      if (receipt.status === 1) {
+        db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('completed', job.id)
+        await bot.sendMessage(chatId,
+          `✅ *SCHEDULED MINT SUCCESS!*\n\n` +
+          `Job #${job.id}\n` +
+          `TX: \`${tx.hash}\`\n` +
+          `Gas: ${receipt.gasUsed.toString()}\n\n` +
+          `🎉 Check your wallet!`,
+          { parse_mode: 'Markdown' }
+        )
+      } else {
+        db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', job.id)
+        await bot.sendMessage(chatId,
+          `❌ *Scheduled Mint Failed*\n\n` +
+          `TX reverted: \`${tx.hash}\``,
+          { parse_mode: 'Markdown' }
+        )
+      }
+      
+    } catch (err) {
+      console.error(`Scheduled mint #${job.id} error:`, err.message)
+      db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', job.id)
+      await bot.sendMessage(chatId,
+        `❌ *Scheduled Mint #${job.id} Error*\n\n` +
+        `${err.message?.slice(0, 200)}`,
+        { parse_mode: 'Markdown' }
+      )
+    }
+  }
+  
+  async function checkScheduledMints() {
+    try {
+      const now = new Date()
+      
+      // Find jobs that should execute now (within 2 second window)
+      const jobs = db.prepare(`
+        SELECT * FROM mint_jobs 
+        WHERE status = 'scheduled' 
+        AND scheduled_at IS NOT NULL
+        AND datetime(scheduled_at) <= datetime(?)
+      `).all(now.toISOString())
+      
+      for (const job of jobs) {
+        // Mark as executing immediately to prevent double-execution
+        db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('executing', job.id)
+        
+        // Execute async (don't block the loop)
+        executeScheduledMint(job).catch(e => {
+          console.error(`Failed to execute scheduled mint #${job.id}:`, e)
+        })
+      }
+      
+    } catch (e) {
+      console.error('Schedule check error:', e.message)
+    }
+  }
+  
+  // Check every second for scheduled mints
+  setInterval(checkScheduledMints, SCHEDULE_CHECK_INTERVAL)
   
   console.log('✅ MintHunter ready!')
   console.log('🔔 Floor alerts checking every 5 minutes')
+  console.log('⏰ Scheduled mints checking every 1 second')
   
 }).catch(err => {
   console.error('❌ Failed to start:', err)

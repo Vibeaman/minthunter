@@ -74,10 +74,18 @@ async function initDb() {
       mint_mode TEXT DEFAULT 'normal',
       status TEXT DEFAULT 'pending',
       tx_hash TEXT,
+      scheduled_at DATETIME,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       executed_at DATETIME
     )
   `)
+
+  // Add scheduled_at column if it doesn't exist (migration)
+  try {
+    db.run('ALTER TABLE mint_jobs ADD COLUMN scheduled_at DATETIME')
+  } catch (e) {
+    // Column already exists, ignore
+  }
 
   db.run(`
     CREATE TABLE IF NOT EXISTS whale_watches (

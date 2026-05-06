@@ -25,6 +25,7 @@ const alertsMenu = {
 const mintMenu = {
   inline_keyboard: [
     [{ text: '➕ New Mint Job', callback_data: 'mint_new' }],
+    [{ text: '⏰ Schedule Mint', callback_data: 'mint_schedule' }],
     [{ text: '⏳ Pending Jobs', callback_data: 'mint_pending' }],
     [{ text: '✅ Completed', callback_data: 'mint_completed' }],
     [{ text: '🔙 Back', callback_data: 'menu_main' }]
