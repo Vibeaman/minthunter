@@ -202,8 +202,41 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+// Cache ETH price (refresh every 5 min)
+let cachedEthPrice = null
+let ethPriceCacheTime = 0
+const ETH_PRICE_CACHE_TTL = 5 * 60 * 1000
+
+/**
+ * Get current ETH price in USD
+ */
+async function getEthPrice() {
+  // Return cached if fresh
+  if (cachedEthPrice && (Date.now() - ethPriceCacheTime) < ETH_PRICE_CACHE_TTL) {
+    return cachedEthPrice
+  }
+  
+  try {
+    const data = await fetchJson(
+      'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd'
+    )
+    
+    if (data?.ethereum?.usd) {
+      cachedEthPrice = data.ethereum.usd
+      ethPriceCacheTime = Date.now()
+      return cachedEthPrice
+    }
+  } catch (e) {
+    console.log('ETH price fetch error:', e.message)
+  }
+  
+  // Fallback to cached or default
+  return cachedEthPrice || 2500
+}
+
 module.exports = {
   getFloorPrice,
   checkAlerts,
-  getTrending
+  getTrending,
+  getEthPrice
 }

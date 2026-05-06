@@ -10,7 +10,7 @@ const db = require('./db')
 const { mainMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
 const { encryptPrivateKey, decryptPrivateKey } = require('./crypto')
 const { getProvider, broadcastToAll } = require('./provider')
-const { getFloorPrice, checkAlerts, getTrending } = require('./services/floor')
+const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./services/floor')
 const { ethers } = require('ethers')
 
 // Fee config
@@ -284,15 +284,20 @@ initDb().then(() => {
       
       userState.delete(userId)
       
+      // Get ETH price for USD conversion
+      const ethPrice = await getEthPrice()
+      const mintPriceUsd = (parseFloat(state.mintPrice) * ethPrice).toFixed(2)
+      const feeUsd = (parseFloat(FCFS_FEE) * ethPrice).toFixed(2)
+      
       const feeNote = state.mode !== 'normal' 
-        ? `\n\n💰 Fee: ${FCFS_FEE} ETH (paid on execution)`
+        ? `\n\n💰 Fee: ${FCFS_FEE} ETH (~$${feeUsd})`
         : ''
       
       await bot.sendMessage(chatId,
         `✅ *Mint Job Created*\n\n` +
         `📋 Job #${jobId}\n` +
         `📍 Contract: \`${state.contract.slice(0, 10)}...\`\n` +
-        `💎 Price: ${state.mintPrice} ETH\n` +
+        `💎 Price: ${state.mintPrice} ETH (~$${mintPriceUsd})\n` +
         `⚡ Mode: ${state.mode.toUpperCase()}\n` +
         `⛽ Gas: ${gasLevel}${feeNote}`,
         {
@@ -350,11 +355,16 @@ initDb().then(() => {
         
         if (balance < totalNeeded) {
           const shortfall = ethers.formatEther(totalNeeded - balance)
+          const ethPrice = await getEthPrice()
+          const needUsd = (parseFloat(ethers.formatEther(totalNeeded)) * ethPrice).toFixed(2)
+          const haveUsd = (parseFloat(ethers.formatEther(balance)) * ethPrice).toFixed(2)
+          const shortUsd = (parseFloat(shortfall) * ethPrice).toFixed(2)
+          
           await bot.sendMessage(chatId,
             `❌ *Insufficient Balance*\n\n` +
-            `Need: ~${ethers.formatEther(totalNeeded)} ETH\n` +
-            `Have: ${ethers.formatEther(balance)} ETH\n` +
-            `Short: ${shortfall} ETH`,
+            `Need: ~${ethers.formatEther(totalNeeded)} ETH (~$${needUsd})\n` +
+            `Have: ${ethers.formatEther(balance)} ETH (~$${haveUsd})\n` +
+            `Short: ${shortfall} ETH (~$${shortUsd})`,
             { parse_mode: 'Markdown', reply_markup: mintMenu }
           )
           return
