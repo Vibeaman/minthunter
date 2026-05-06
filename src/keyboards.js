@@ -8,7 +8,6 @@ const mainMenu = {
     [{ text: '🔔 Floor Alerts', callback_data: 'menu_alerts' }],
     [{ text: '⚡ Mint', callback_data: 'menu_mint' }],
     [{ text: '👛 Wallets', callback_data: 'menu_wallets' }],
-    [{ text: '🐋 Whale Watch', callback_data: 'menu_whales' }],
     [{ text: '🔥 Trending', callback_data: 'menu_trending' }]
   ]
 }
@@ -37,15 +36,6 @@ const walletsMenu = {
   inline_keyboard: [
     [{ text: '➕ Add Wallet', callback_data: 'wallet_add' }],
     [{ text: '📋 My Wallets', callback_data: 'wallet_list' }],
-    [{ text: '🔙 Back', callback_data: 'menu_main' }]
-  ]
-}
-
-// Whales menu
-const whalesMenu = {
-  inline_keyboard: [
-    [{ text: '➕ Track Wallet', callback_data: 'whale_add' }],
-    [{ text: '📋 Watching', callback_data: 'whale_list' }],
     [{ text: '🔙 Back', callback_data: 'menu_main' }]
   ]
 }
@@ -101,7 +91,6 @@ module.exports = {
   alertsMenu,
   mintMenu,
   walletsMenu,
-  whalesMenu,
   mintModeMenu,
   gasOptions,
   alertCondition,
