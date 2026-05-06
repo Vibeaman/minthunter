@@ -137,24 +137,47 @@ async function checkAlerts(db, bot) {
 
 /**
  * Get trending collections (top by volume)
+ * Uses CoinGecko NFT API as primary (more reliable)
  */
 async function getTrending() {
+  // Try CoinGecko first (more reliable)
   try {
     const data = await fetchJson(
-      'https://api.reservoir.tools/collections/trending/v1?period=24h&limit=10'
+      'https://api.coingecko.com/api/v3/nfts/markets?order=volume_24h_desc&per_page=10'
+    )
+    
+    if (data && Array.isArray(data) && data.length > 0) {
+      return data.map(c => ({
+        name: c.name || 'Unknown',
+        floor: c.floor_price?.native_currency || 0,
+        floorUsd: c.floor_price?.usd || 0,
+        volume24h: c.volume_24h?.native_currency || 0,
+        change24h: c.floor_price_24h_percentage_change || 0,
+        address: c.contract_address
+      }))
+    }
+  } catch (e) {
+    console.log('CoinGecko trending error:', e.message)
+  }
+  
+  // Fallback to Reservoir
+  try {
+    const data = await fetchJson(
+      'https://api.reservoir.tools/collections/v6?sortBy=1DayVolume&limit=10'
     )
     
     if (data?.collections) {
       return data.collections.map(c => ({
         name: c.name || 'Unknown',
         floor: c.floorAsk?.price?.amount?.native || 0,
-        volume24h: c.volume?.['24h'] || 0,
-        change24h: c.floorSaleChange?.['24h'] || 0,
-        address: c.id || c.primaryContract
+        floorUsd: c.floorAsk?.price?.amount?.usd || 0,
+        volume24h: c.volume?.['1day'] || 0,
+        change24h: c.floorSaleChange?.['1day'] || 0,
+        address: c.primaryContract || c.id
       }))
     }
   } catch (e) {
-    console.log('Trending fetch error:', e.message)
+    console.log('Reservoir trending error:', e.message)
   }
   
   return []

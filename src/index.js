@@ -692,12 +692,18 @@ initDb().then(() => {
         
         for (let i = 0; i < Math.min(trending.length, 10); i++) {
           const c = trending[i]
-          const change = c.change24h > 0 ? `+${(c.change24h * 100).toFixed(1)}%` : `${(c.change24h * 100).toFixed(1)}%`
-          const changeEmoji = c.change24h > 0 ? '🟢' : '🔴'
+          const change = c.change24h !== 0 
+            ? (c.change24h > 0 ? `+${c.change24h.toFixed(1)}%` : `${c.change24h.toFixed(1)}%`)
+            : '0%'
+          const changeEmoji = c.change24h > 0 ? '🟢' : c.change24h < 0 ? '🔴' : '⚪'
+          
+          const floorDisplay = c.floor ? c.floor.toFixed(4) : '?'
+          const floorUsdDisplay = c.floorUsd ? ` ($${c.floorUsd.toFixed(0)})` : ''
+          const volDisplay = c.volume24h ? c.volume24h.toFixed(2) : '?'
           
           text += `${i + 1}. *${c.name}*\n`
-          text += `   Floor: ${c.floor.toFixed(4)} ETH ${changeEmoji} ${change}\n`
-          text += `   Vol: ${c.volume24h.toFixed(2)} ETH\n\n`
+          text += `   Floor: ${floorDisplay} ETH${floorUsdDisplay} ${changeEmoji} ${change}\n`
+          text += `   Vol: ${volDisplay} ETH\n\n`
         }
         
         await bot.sendMessage(chatId, text, {
