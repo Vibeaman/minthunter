@@ -7,9 +7,10 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const TelegramBot = require('node-telegram-bot-api')
 const { initDb } = require('./db')
 const db = require('./db')
-const { mainMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, backToMain } = require('./keyboards')
+const { mainMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
 const { encryptPrivateKey, decryptPrivateKey } = require('./crypto')
 const { getProvider, broadcastToAll } = require('./provider')
+const { getFloorPrice, checkAlerts, getTrending } = require('./services/floor')
 const { ethers } = require('ethers')
 
 // Fee config
@@ -546,7 +547,164 @@ initDb().then(() => {
       return
     }
 
-    // Placeholder for other menus
+    // ========== FLOOR ALERTS MENU ==========
+    if (data === 'menu_alerts') {
+      userState.delete(userId)
+      await bot.editMessageText(
+        '🔔 *Floor Price Alerts*\n\n' +
+        'Get notified when NFT collections hit your target price.\n\n' +
+        '• Set alerts for any collection\n' +
+        '• Trigger when price goes above/below target\n' +
+        '• Auto-checked every 5 minutes',
+        {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          parse_mode: 'Markdown',
+          reply_markup: alertsMenu
+        }
+      )
+      return
+    }
+
+    // New alert - ask for collection address
+    if (data === 'alert_new') {
+      userState.set(userId, { step: 'alert_collection' })
+      await bot.sendMessage(chatId,
+        '🔔 *New Floor Alert*\n\n' +
+        'Send the NFT collection contract address:\n\n' +
+        '_Example: 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d (BAYC)_\n\n' +
+        '_Send /cancel to abort_',
+        { parse_mode: 'Markdown' }
+      )
+      return
+    }
+
+    // Select alert condition (above/below)
+    if (data.startsWith('condition_')) {
+      const state = userState.get(userId)
+      if (!state || !state.alertPrice) {
+        await bot.sendMessage(chatId, '❌ Session expired. Start over.', { reply_markup: alertsMenu })
+        return
+      }
+      
+      const condition = data.replace('condition_', '') // 'above' or 'below'
+      
+      // Create the alert
+      const result = db.prepare(`
+        INSERT INTO floor_alerts 
+        (telegram_id, collection_address, collection_name, target_price, condition, is_active)
+        VALUES (?, ?, ?, ?, ?, 1)
+      `).run(
+        userId,
+        state.collection,
+        state.collectionName || 'Unknown',
+        state.alertPrice,
+        condition
+      )
+      
+      const alertId = result.lastInsertRowid
+      console.log(`🔔 Created alert #${alertId} for user ${userId}`)
+      
+      userState.delete(userId)
+      
+      const symbol = condition === 'below' ? '📉' : '📈'
+      await bot.sendMessage(chatId,
+        `✅ *Alert Created*\n\n` +
+        `📋 Alert #${alertId}\n` +
+        `📍 Collection: \`${state.collection.slice(0, 10)}...\`\n` +
+        `${symbol} Trigger: ${condition} ${state.alertPrice} ETH\n\n` +
+        `You'll be notified when the floor price goes ${condition} ${state.alertPrice} ETH.`,
+        { parse_mode: 'Markdown', reply_markup: alertsMenu }
+      )
+      return
+    }
+
+    // List alerts
+    if (data === 'alert_list') {
+      const alerts = db.prepare(`
+        SELECT * FROM floor_alerts 
+        WHERE telegram_id = ? AND is_active = 1
+        ORDER BY created_at DESC
+      `).all(userId)
+      
+      if (alerts.length === 0) {
+        await bot.sendMessage(chatId,
+          '🔔 No active alerts.\n\nCreate one to get notified when floors move!',
+          { reply_markup: alertsMenu }
+        )
+        return
+      }
+      
+      let text = '🔔 *Your Floor Alerts*\n\n'
+      const buttons = []
+      
+      for (const alert of alerts) {
+        const symbol = alert.condition === 'below' ? '📉' : '📈'
+        const short = alert.collection_address.slice(0, 8) + '...'
+        text += `#${alert.id} - \`${short}\`\n`
+        text += `   ${symbol} ${alert.condition} ${alert.target_price} ETH\n\n`
+        buttons.push([{ text: `🗑 Delete #${alert.id}`, callback_data: `alert_delete_${alert.id}` }])
+      }
+      
+      buttons.push([{ text: '🔙 Back', callback_data: 'menu_alerts' }])
+      
+      await bot.sendMessage(chatId, text, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: buttons }
+      })
+      return
+    }
+
+    // Delete alert
+    if (data.startsWith('alert_delete_')) {
+      const alertId = parseInt(data.split('_')[2])
+      db.prepare('UPDATE floor_alerts SET is_active = 0 WHERE id = ? AND telegram_id = ?').run(alertId, userId)
+      await bot.sendMessage(chatId, '✅ Alert deleted.', { reply_markup: alertsMenu })
+      return
+    }
+
+    // ========== TRENDING MENU ==========
+    if (data === 'menu_trending') {
+      await bot.sendMessage(chatId, '🔥 Fetching trending collections...')
+      
+      try {
+        const trending = await getTrending()
+        
+        if (!trending || trending.length === 0) {
+          await bot.sendMessage(chatId,
+            '⚠️ Could not fetch trending data right now.',
+            { reply_markup: mainMenu }
+          )
+          return
+        }
+        
+        let text = '🔥 *Trending Collections (24h)*\n\n'
+        
+        for (let i = 0; i < Math.min(trending.length, 10); i++) {
+          const c = trending[i]
+          const change = c.change24h > 0 ? `+${(c.change24h * 100).toFixed(1)}%` : `${(c.change24h * 100).toFixed(1)}%`
+          const changeEmoji = c.change24h > 0 ? '🟢' : '🔴'
+          
+          text += `${i + 1}. *${c.name}*\n`
+          text += `   Floor: ${c.floor.toFixed(4)} ETH ${changeEmoji} ${change}\n`
+          text += `   Vol: ${c.volume24h.toFixed(2)} ETH\n\n`
+        }
+        
+        await bot.sendMessage(chatId, text, {
+          parse_mode: 'Markdown',
+          reply_markup: mainMenu
+        })
+      } catch (e) {
+        console.error('Trending error:', e)
+        await bot.sendMessage(chatId,
+          '❌ Error fetching trending data.',
+          { reply_markup: mainMenu }
+        )
+      }
+      return
+    }
+
+    // Placeholder for other menus (whales - next part)
     if (data.startsWith('menu_')) {
       await bot.sendMessage(chatId, `📋 ${data} - Coming in next part!`)
     }
@@ -569,6 +727,60 @@ initDb().then(() => {
     
     if (!state) return // No active flow
     
+    // ALERT: Receiving collection address
+    if (state.step === 'alert_collection') {
+      const collection = msg.text?.trim()
+      
+      // Validate address
+      if (!collection || !ethers.isAddress(collection)) {
+        await bot.sendMessage(chatId,
+          '❌ Invalid contract address.\n\n_Send /cancel to abort_',
+          { parse_mode: 'Markdown' }
+        )
+        return
+      }
+      
+      state.collection = collection
+      state.step = 'alert_price'
+      userState.set(userId, state)
+      
+      // Try to fetch collection name (optional enhancement)
+      await bot.sendMessage(chatId,
+        '🔔 *Set Target Price*\n\n' +
+        'Enter the floor price target in ETH:\n\n' +
+        '_Example: 0.5 or 1.25_\n\n' +
+        '_Send /cancel to abort_',
+        { parse_mode: 'Markdown' }
+      )
+      return
+    }
+
+    // ALERT: Receiving target price
+    if (state.step === 'alert_price') {
+      const priceText = msg.text?.trim()
+      const price = parseFloat(priceText)
+      
+      if (isNaN(price) || price <= 0) {
+        await bot.sendMessage(chatId,
+          '❌ Invalid price. Enter a positive number (e.g., 0.5).\n\n_Send /cancel to abort_',
+          { parse_mode: 'Markdown' }
+        )
+        return
+      }
+      
+      state.alertPrice = priceText
+      state.step = 'alert_condition'
+      userState.set(userId, state)
+      
+      await bot.sendMessage(chatId,
+        '🔔 *Alert Condition*\n\n' +
+        `Target: ${priceText} ETH\n\n` +
+        'When should you be notified?',
+        { parse_mode: 'Markdown', reply_markup: alertCondition }
+      )
+      return
+    }
+
     // MINT: Receiving contract address
     if (state.step === 'mint_contract') {
       const contract = msg.text?.trim()
@@ -673,7 +885,30 @@ initDb().then(() => {
     }
   })
 
+  // ========== BACKGROUND SERVICES ==========
+  
+  // Check floor alerts every 5 minutes
+  const ALERT_CHECK_INTERVAL = 5 * 60 * 1000 // 5 minutes
+  
+  async function runAlertCheck() {
+    try {
+      const triggered = await checkAlerts(db, bot)
+      if (triggered.length > 0) {
+        console.log(`🚨 ${triggered.length} alerts triggered`)
+      }
+    } catch (e) {
+      console.error('Alert check error:', e.message)
+    }
+  }
+  
+  // Initial check after 30 seconds
+  setTimeout(runAlertCheck, 30000)
+  
+  // Then check every 5 minutes
+  setInterval(runAlertCheck, ALERT_CHECK_INTERVAL)
+  
   console.log('✅ MintHunter ready!')
+  console.log('🔔 Floor alerts checking every 5 minutes')
   
 }).catch(err => {
   console.error('❌ Failed to start:', err)
