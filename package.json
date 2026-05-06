@@ -1,0 +1,16 @@
+{
+  "name": "minthunter",
+  "version": "1.0.0",
+  "description": "NFT floor alerts + auto-mint Telegram bot",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "ethers": "^6.16.0",
+    "sql.js": "^1.11.0",
+    "dotenv": "^16.4.5"
+  }
+}
