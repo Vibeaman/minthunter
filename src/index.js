@@ -52,13 +52,16 @@ initDb().then(() => {
     // Clear any pending state
     userState.delete(userId)
     
+    // Escape username for Markdown (underscores break it)
+    const safeUsername = username.replace(/_/g, '\\_')
+    
     await bot.sendMessage(chatId, 
       `🎯 *MintHunter*\n\n` +
-      `Welcome ${username}!\n\n` +
+      `Welcome ${safeUsername}!\n\n` +
       `• 🔔 Set floor price alerts\n` +
       `• ⚡ FCFS competitive minting\n` +
       `• 👛 Secure wallet management\n` +
-      `• 🐋 Track whale wallets\n\n` +
+      `• 🔥 Trending collections\n\n` +
       `What would you like to do?`,
       { parse_mode: 'Markdown', reply_markup: mainMenu }
     )
