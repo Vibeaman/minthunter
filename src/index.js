@@ -7,7 +7,7 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const TelegramBot = require('node-telegram-bot-api')
 const { initDb } = require('./db')
 const db = require('./db')
-const { mainMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
+const { mainMenu, settingsMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
 const { encryptPrivateKey, decryptPrivateKey } = require('./crypto')
 const { getProvider, broadcastToAll, fcfsBroadcast } = require('./provider')
 const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./services/floor')
@@ -372,8 +372,16 @@ initDb().then(() => {
         // Check balance
         const balance = await provider.getBalance(wallet.address)
         const baseMintCost = ethers.parseEther(job.mint_price || '0')
-        // Add 5% slippage buffer (most contracts refund excess)
-        const mintCost = baseMintCost + (baseMintCost * 5n / 100n)
+        
+        // Check user's slippage setting
+        const userSettings = db.prepare('SELECT slippage_enabled FROM users WHERE telegram_id = ?').get(job.telegram_id)
+        const slippageEnabled = userSettings?.slippage_enabled === 1
+        
+        // Add 5% slippage buffer if enabled
+        const mintCost = slippageEnabled 
+          ? baseMintCost + (baseMintCost * 5n / 100n)
+          : baseMintCost
+        
         const fee = job.mint_mode !== 'normal' ? ethers.parseEther(FCFS_FEE) : 0n
         const gasEstimate = BigInt(job.gas_limit) * ethers.parseUnits('50', 'gwei') // rough estimate
         const totalNeeded = mintCost + fee + gasEstimate
@@ -762,6 +770,58 @@ initDb().then(() => {
       const alertId = parseInt(data.split('_')[2])
       db.prepare('UPDATE floor_alerts SET is_active = 0 WHERE id = ? AND telegram_id = ?').run(alertId, userId)
       await bot.sendMessage(chatId, '✅ Alert deleted.', { reply_markup: alertsMenu })
+      return
+    }
+
+    // ========== SETTINGS MENU ==========
+    if (data === 'menu_settings') {
+      const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      const slippageStatus = user?.slippage_enabled ? 'ON' : 'OFF'
+      const slippageEmoji = user?.slippage_enabled ? '✅' : '❌'
+      
+      await bot.sendMessage(chatId,
+        `⚙️ *Settings*\n\n` +
+        `📉 *Slippage Protection:* ${slippageEmoji} ${slippageStatus}\n\n` +
+        `_When ON, sends 5% extra ETH on mints._\n` +
+        `_Most contracts refund excess, some don't._`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
+              [{ text: '🔙 Back', callback_data: 'menu_main' }]
+            ]
+          }
+        }
+      )
+      return
+    }
+
+    // Toggle slippage
+    if (data === 'toggle_slippage') {
+      const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      const newValue = user?.slippage_enabled ? 0 : 1
+      
+      db.prepare('UPDATE users SET slippage_enabled = ? WHERE telegram_id = ?').run(newValue, userId)
+      
+      const slippageStatus = newValue ? 'ON' : 'OFF'
+      const slippageEmoji = newValue ? '✅' : '❌'
+      
+      await bot.sendMessage(chatId,
+        `⚙️ *Settings*\n\n` +
+        `📉 *Slippage Protection:* ${slippageEmoji} ${slippageStatus}\n\n` +
+        `_When ON, sends 5% extra ETH on mints._\n` +
+        `_Most contracts refund excess, some don't._`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
+              [{ text: '🔙 Back', callback_data: 'menu_main' }]
+            ]
+          }
+        }
+      )
       return
     }
 
@@ -1251,8 +1311,16 @@ initDb().then(() => {
       // Check balance
       const balance = await provider.getBalance(wallet.address)
       const baseMintCost = ethers.parseEther(job.mint_price || '0')
-      // Add 5% slippage buffer (most contracts refund excess)
-      const mintCost = baseMintCost + (baseMintCost * 5n / 100n)
+      
+      // Check user's slippage setting
+      const userSettings = db.prepare('SELECT slippage_enabled FROM users WHERE telegram_id = ?').get(job.telegram_id)
+      const slippageEnabled = userSettings?.slippage_enabled === 1
+      
+      // Add 5% slippage buffer if enabled
+      const mintCost = slippageEnabled 
+        ? baseMintCost + (baseMintCost * 5n / 100n)
+        : baseMintCost
+      
       const fee = ethers.parseEther(FCFS_FEE)
       const gasEstimate = BigInt(job.gas_limit) * ethers.parseUnits('100', 'gwei') // High gas for speed
       const totalNeeded = mintCost + fee + gasEstimate

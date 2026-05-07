@@ -8,7 +8,16 @@ const mainMenu = {
     [{ text: '🔔 Floor Alerts', callback_data: 'menu_alerts' }],
     [{ text: '⚡ Mint', callback_data: 'menu_mint' }],
     [{ text: '👛 Wallets', callback_data: 'menu_wallets' }],
-    [{ text: '🔥 Trending', callback_data: 'menu_trending' }]
+    [{ text: '🔥 Trending', callback_data: 'menu_trending' }],
+    [{ text: '⚙️ Settings', callback_data: 'menu_settings' }]
+  ]
+}
+
+// Settings menu
+const settingsMenu = {
+  inline_keyboard: [
+    [{ text: '📉 Slippage: OFF', callback_data: 'toggle_slippage' }],
+    [{ text: '🔙 Back', callback_data: 'menu_main' }]
   ]
 }
 
@@ -89,6 +98,7 @@ const backToMain = {
 
 module.exports = {
   mainMenu,
+  settingsMenu,
   alertsMenu,
   mintMenu,
   walletsMenu,
