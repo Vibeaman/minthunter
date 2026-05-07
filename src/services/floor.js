@@ -5,48 +5,53 @@
 
 const https = require('https')
 
+// Load Alchemy API key from env
+require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env') })
+const ALCHEMY_API_KEY = process.env.ALCHEMY_RPC?.split('/').pop() || ''
+
 /**
- * Fetch floor price from Reservoir API (free, no key needed for basic)
- * Falls back to OpenSea if needed
+ * Fetch floor price from Alchemy NFT API
+ * Falls back to SimpleHash if needed
  */
 async function getFloorPrice(contractAddress) {
-  // Try Reservoir first (free tier)
-  try {
-    const data = await fetchJson(
-      `https://api.reservoir.tools/collections/v6?contract=${contractAddress}`
-    )
-    
-    if (data?.collections?.[0]) {
-      const collection = data.collections[0]
-      return {
-        floor: collection.floorAsk?.price?.amount?.native || 0,
-        name: collection.name || 'Unknown',
-        symbol: collection.symbol || '',
-        source: 'reservoir'
+  // Try Alchemy NFT API first (you have a key)
+  if (ALCHEMY_API_KEY) {
+    try {
+      const data = await fetchJson(
+        `https://eth-mainnet.g.alchemy.com/nft/v3/${ALCHEMY_API_KEY}/getFloorPrice?contractAddress=${contractAddress}`
+      )
+      
+      if (data?.openSea?.floorPrice || data?.looksRare?.floorPrice) {
+        const floor = data.openSea?.floorPrice || data.looksRare?.floorPrice || 0
+        return {
+          floor: floor,
+          name: data.openSea?.collectionName || 'Unknown',
+          symbol: '',
+          source: 'alchemy'
+        }
       }
+    } catch (e) {
+      console.log(`Alchemy error for ${contractAddress}: ${e.message}`)
     }
-  } catch (e) {
-    console.log(`Reservoir error for ${contractAddress}: ${e.message}`)
   }
   
-  // Fallback: try to scrape from OpenSea public API
+  // Fallback: SimpleHash free tier
   try {
     const data = await fetchJson(
-      `https://api.opensea.io/api/v2/collections?chain=ethereum&contract_addresses=${contractAddress}`,
-      { 'X-API-KEY': '' } // Works without key for basic requests
+      `https://api.simplehash.com/api/v0/nfts/collections/ethereum/${contractAddress}`,
+      { 'X-API-KEY': '' }
     )
     
-    if (data?.collections?.[0]) {
-      const collection = data.collections[0]
+    if (data?.floor_prices?.[0]) {
       return {
-        floor: collection.stats?.floor_price || 0,
-        name: collection.name || 'Unknown',
-        symbol: collection.symbol || '',
-        source: 'opensea'
+        floor: data.floor_prices[0].value / 1e18 || 0,
+        name: data.name || 'Unknown',
+        symbol: data.symbol || '',
+        source: 'simplehash'
       }
     }
   } catch (e) {
-    console.log(`OpenSea error for ${contractAddress}: ${e.message}`)
+    console.log(`SimpleHash error for ${contractAddress}: ${e.message}`)
   }
   
   return null
