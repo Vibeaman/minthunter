@@ -456,12 +456,26 @@ initDb().then(() => {
         
         if (receipt.status === 1) {
           db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('completed', jobId)
+          
+          // Generate sell links
+          const openseaLink = `https://opensea.io/assets/ethereum/${job.contract_address}`
+          const blurLink = `https://blur.io/eth/collection/${job.contract_address}`
+          
           await bot.sendMessage(chatId,
             `✅ *Mint Successful!*\n\n` +
             `TX: \`${tx.hash}\`\n` +
             `Gas Used: ${receipt.gasUsed.toString()}\n\n` +
-            `🎉 Check your wallet for the NFT!`,
-            { parse_mode: 'Markdown', reply_markup: mainMenu }
+            `🎉 *List it for sale:*`,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: '🟠 Sell on OpenSea', url: openseaLink }],
+                  [{ text: '🟣 Sell on Blur', url: blurLink }],
+                  [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
+                ]
+              }
+            }
           )
         } else {
           db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', jobId)
@@ -1237,13 +1251,28 @@ initDb().then(() => {
       
       if (receipt.status === 1) {
         db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('completed', job.id)
+        
+        // Generate sell links
+        const contractAddr = job.contract_address
+        const openseaLink = `https://opensea.io/assets/ethereum/${contractAddr}`
+        const blurLink = `https://blur.io/eth/collection/${contractAddr}`
+        
         await bot.sendMessage(chatId,
           `✅ *SCHEDULED MINT SUCCESS!*\n\n` +
           `Job #${job.id}\n` +
           `TX: \`${tx.hash}\`\n` +
           `Gas: ${receipt.gasUsed.toString()}\n\n` +
-          `🎉 Check your wallet!`,
-          { parse_mode: 'Markdown' }
+          `🎉 *List it for sale:*`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '🟠 Sell on OpenSea', url: openseaLink }],
+                [{ text: '🟣 Sell on Blur', url: blurLink }],
+                [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
+              ]
+            }
+          }
         )
       } else {
         db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', job.id)
