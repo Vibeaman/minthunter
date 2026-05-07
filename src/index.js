@@ -830,11 +830,15 @@ initDb().then(() => {
       state.step = 'alert_price'
       userState.set(userId, state)
       
-      // Try to fetch collection name (optional enhancement)
+      // Get ETH price for USD example
+      const ethPrice = await getEthPrice()
+      const usdExample = (0.5 * ethPrice).toFixed(0)
+      
       await bot.sendMessage(chatId,
         '🔔 *Set Target Price*\n\n' +
-        'Enter the floor price target in ETH:\n\n' +
-        '_Example: 0.5 or 1.25_\n\n' +
+        'Enter the floor price target:\n\n' +
+        '_ETH: 0.5 or 1.25_\n' +
+        `_USD: $${usdExample} or $500_\n\n` +
         '_Send /cancel to abort_',
         { parse_mode: 'Markdown' }
       )
@@ -844,23 +848,41 @@ initDb().then(() => {
     // ALERT: Receiving target price
     if (state.step === 'alert_price') {
       const priceText = msg.text?.trim()
-      const price = parseFloat(priceText)
+      let price
+      let isUsd = false
+      
+      // Check if USD format ($100 or 100$)
+      if (priceText.startsWith('$') || priceText.endsWith('$')) {
+        const usdValue = parseFloat(priceText.replace(/\$/g, ''))
+        if (!isNaN(usdValue) && usdValue > 0) {
+          const ethPrice = await getEthPrice()
+          price = usdValue / ethPrice
+          isUsd = true
+        }
+      } else {
+        price = parseFloat(priceText)
+      }
       
       if (isNaN(price) || price <= 0) {
         await bot.sendMessage(chatId,
-          '❌ Invalid price. Enter a positive number (e.g., 0.5).\n\n_Send /cancel to abort_',
+          '❌ Invalid price. Enter a number (e.g., 0.5 or $500).\n\n_Send /cancel to abort_',
           { parse_mode: 'Markdown' }
         )
         return
       }
       
-      state.alertPrice = priceText
+      // Get ETH price for display
+      const ethPrice = await getEthPrice()
+      const ethDisplay = price.toFixed(4)
+      const usdDisplay = (price * ethPrice).toFixed(2)
+      
+      state.alertPrice = ethDisplay
       state.step = 'alert_condition'
       userState.set(userId, state)
       
       await bot.sendMessage(chatId,
         '🔔 *Alert Condition*\n\n' +
-        `Target: ${priceText} ETH\n\n` +
+        `Target: ${ethDisplay} ETH (~$${usdDisplay})\n\n` +
         'When should you be notified?',
         { parse_mode: 'Markdown', reply_markup: alertCondition }
       )
