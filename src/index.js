@@ -371,7 +371,9 @@ initDb().then(() => {
         
         // Check balance
         const balance = await provider.getBalance(wallet.address)
-        const mintCost = ethers.parseEther(job.mint_price || '0')
+        const baseMintCost = ethers.parseEther(job.mint_price || '0')
+        // Add 5% slippage buffer (most contracts refund excess)
+        const mintCost = baseMintCost + (baseMintCost * 5n / 100n)
         const fee = job.mint_mode !== 'normal' ? ethers.parseEther(FCFS_FEE) : 0n
         const gasEstimate = BigInt(job.gas_limit) * ethers.parseUnits('50', 'gwei') // rough estimate
         const totalNeeded = mintCost + fee + gasEstimate
@@ -1248,7 +1250,9 @@ initDb().then(() => {
       
       // Check balance
       const balance = await provider.getBalance(wallet.address)
-      const mintCost = ethers.parseEther(job.mint_price || '0')
+      const baseMintCost = ethers.parseEther(job.mint_price || '0')
+      // Add 5% slippage buffer (most contracts refund excess)
+      const mintCost = baseMintCost + (baseMintCost * 5n / 100n)
       const fee = ethers.parseEther(FCFS_FEE)
       const gasEstimate = BigInt(job.gas_limit) * ethers.parseUnits('100', 'gwei') // High gas for speed
       const totalNeeded = mintCost + fee + gasEstimate
