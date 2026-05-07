@@ -43,14 +43,27 @@ initDb().then(() => {
     console.log(`👋 /start from ${username} (${userId})`)
     
     // Ensure user exists
-    const existing = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
-    if (!existing) {
-      db.prepare('INSERT INTO users (telegram_id, username) VALUES (?, ?)').run(userId, username)
+    let user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+    if (!user) {
+      db.prepare('INSERT INTO users (telegram_id, username, is_authorized) VALUES (?, ?, 0)').run(userId, username)
+      user = { is_authorized: 0 }
       console.log(`✨ New user: ${username}`)
     }
     
     // Clear any pending state
     userState.delete(userId)
+    
+    // Check if authorized
+    if (!user.is_authorized) {
+      userState.set(userId, { step: 'enter_code' })
+      await bot.sendMessage(chatId,
+        `🎯 *MintHunter*\n\n` +
+        `🔐 This bot requires an access code.\n\n` +
+        `Enter your access code:`,
+        { parse_mode: 'Markdown' }
+      )
+      return
+    }
     
     await bot.sendMessage(chatId, 
       `🎯 *MintHunter*\n\n` +
@@ -74,6 +87,16 @@ initDb().then(() => {
     
     // Acknowledge button press
     await bot.answerCallbackQuery(query.id)
+    
+    // Check if user is authorized
+    const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+    if (!user || !user.is_authorized) {
+      await bot.sendMessage(chatId,
+        '🔐 Please enter your access code first.\n\nSend /start to begin.',
+        { parse_mode: 'Markdown' }
+      )
+      return
+    }
     
     // Main menu navigation
     if (data === 'menu_main') {
@@ -809,6 +832,50 @@ initDb().then(() => {
     const state = userState.get(userId)
     
     if (!state) return // No active flow
+    
+    // ACCESS CODE: Validate code
+    if (state.step === 'enter_code') {
+      const code = msg.text?.trim().toUpperCase()
+      
+      // Check if code exists, unused, and not expired
+      const accessCode = db.prepare(`
+        SELECT * FROM access_codes 
+        WHERE code = ? AND used_by IS NULL AND expires_at > datetime('now')
+      `).get(code)
+      
+      if (!accessCode) {
+        await bot.sendMessage(chatId,
+          '❌ Invalid or expired code.\n\n' +
+          'Enter a valid access code:',
+          { parse_mode: 'Markdown' }
+        )
+        return
+      }
+      
+      // Mark code as used
+      db.prepare(`
+        UPDATE access_codes SET used_by = ?, used_at = datetime('now') WHERE id = ?
+      `).run(userId, accessCode.id)
+      
+      // Authorize user
+      db.prepare('UPDATE users SET is_authorized = 1 WHERE telegram_id = ?').run(userId)
+      
+      userState.delete(userId)
+      
+      console.log(`✅ User ${userId} authorized with code ${code}`)
+      
+      await bot.sendMessage(chatId,
+        `✅ *Access Granted!*\n\n` +
+        `Welcome to MintHunter, Grindoor! 👋\n\n` +
+        `• 🔔 Set floor price alerts\n` +
+        `• ⚡ FCFS competitive minting\n` +
+        `• 👛 Secure wallet management\n` +
+        `• 🔥 Trending collections\n\n` +
+        `What would you like to do?`,
+        { parse_mode: 'Markdown', reply_markup: mainMenu }
+      )
+      return
+    }
     
     // ALERT: Receiving collection address
     if (state.step === 'alert_collection') {

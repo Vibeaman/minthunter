@@ -98,6 +98,28 @@ async function initDb() {
     )
   `)
 
+  // Access codes table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS access_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT UNIQUE NOT NULL,
+      used_by INTEGER,
+      used_at DATETIME,
+      expires_at DATETIME NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `)
+
+  // Add is_authorized column to users (migration)
+  try {
+    db.run('ALTER TABLE users ADD COLUMN is_authorized INTEGER DEFAULT 0')
+  } catch (e) {
+    // Column already exists
+  }
+
+  // Reset all existing users to unauthorized
+  db.run('UPDATE users SET is_authorized = 0')
+
   save()
   initialized = true
   console.log('✅ Database initialized')
