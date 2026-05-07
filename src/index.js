@@ -53,12 +53,17 @@ initDb().then(() => {
     // Clear any pending state
     userState.delete(userId)
     
-    // Check if authorized
-    if (!user.is_authorized) {
+    // Check if authorized and not expired
+    const isExpired = user.access_expires && new Date(user.access_expires) < new Date()
+    if (!user.is_authorized || isExpired) {
+      // Reset authorization if expired
+      if (isExpired) {
+        db.prepare('UPDATE users SET is_authorized = 0 WHERE telegram_id = ?').run(userId)
+      }
       userState.set(userId, { step: 'enter_code' })
       await bot.sendMessage(chatId,
         `🎯 *MintHunter*\n\n` +
-        `🔐 This bot requires an access code.\n\n` +
+        `🔐 ${isExpired ? 'Your access has expired.' : 'This bot requires an access code.'}\n\n` +
         `Enter your access code:`,
         { parse_mode: 'Markdown' }
       )
@@ -88,11 +93,12 @@ initDb().then(() => {
     // Acknowledge button press
     await bot.answerCallbackQuery(query.id)
     
-    // Check if user is authorized
+    // Check if user is authorized and not expired
     const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
-    if (!user || !user.is_authorized) {
+    const isExpired = user?.access_expires && new Date(user.access_expires) < new Date()
+    if (!user || !user.is_authorized || isExpired) {
       await bot.sendMessage(chatId,
-        '🔐 Please enter your access code first.\n\nSend /start to begin.',
+        `🔐 ${isExpired ? 'Your access has expired.' : 'Please enter your access code first.'}\n\nSend /start to begin.`,
         { parse_mode: 'Markdown' }
       )
       return
@@ -899,10 +905,10 @@ initDb().then(() => {
     if (state.step === 'enter_code') {
       const code = msg.text?.trim().toUpperCase()
       
-      // Check if code exists, unused, and not expired
+      // Check if code exists and not expired (reusable until expiry)
       const accessCode = db.prepare(`
         SELECT * FROM access_codes 
-        WHERE code = ? AND used_by IS NULL AND expires_at > datetime('now')
+        WHERE code = ? AND expires_at > datetime('now')
       `).get(code)
       
       if (!accessCode) {
@@ -914,13 +920,8 @@ initDb().then(() => {
         return
       }
       
-      // Mark code as used
-      db.prepare(`
-        UPDATE access_codes SET used_by = ?, used_at = datetime('now') WHERE id = ?
-      `).run(userId, accessCode.id)
-      
-      // Authorize user
-      db.prepare('UPDATE users SET is_authorized = 1 WHERE telegram_id = ?').run(userId)
+      // Authorize user with access expiring when code expires
+      db.prepare('UPDATE users SET is_authorized = 1, access_expires = ? WHERE telegram_id = ?').run(accessCode.expires_at, userId)
       
       userState.delete(userId)
       

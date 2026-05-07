@@ -124,6 +124,13 @@ async function initDb() {
     // Column already exists
   }
 
+  // Add access_expires column to users (migration)
+  try {
+    db.run('ALTER TABLE users ADD COLUMN access_expires DATETIME')
+  } catch (e) {
+    // Column already exists
+  }
+
   // Reset all existing users to unauthorized
   db.run('UPDATE users SET is_authorized = 0')
 
