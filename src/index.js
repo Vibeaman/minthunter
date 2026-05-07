@@ -905,23 +905,31 @@ initDb().then(() => {
     if (state.step === 'enter_code') {
       const code = msg.text?.trim().toUpperCase()
       
-      // Check if code exists and not expired (reusable until expiry)
+      // Check if code exists, NOT already used, and not expired
       const accessCode = db.prepare(`
         SELECT * FROM access_codes 
-        WHERE code = ? AND expires_at > datetime('now')
+        WHERE code = ? AND used_by IS NULL AND expires_at > datetime('now')
       `).get(code)
       
       if (!accessCode) {
         await bot.sendMessage(chatId,
-          '❌ Invalid or expired code.\n\n' +
+          '❌ Invalid, already used, or expired code.\n\n' +
           'Enter a valid access code:',
           { parse_mode: 'Markdown' }
         )
         return
       }
       
-      // Authorize user with access expiring when code expires
-      db.prepare('UPDATE users SET is_authorized = 1, access_expires = ? WHERE telegram_id = ?').run(accessCode.expires_at, userId)
+      // Mark code as used by this user (one-time use)
+      db.prepare(`
+        UPDATE access_codes SET used_by = ?, used_at = datetime('now') WHERE id = ?
+      `).run(userId, accessCode.id)
+      
+      // Grant 30 days access from NOW (not code expiry)
+      const accessExpires = new Date()
+      accessExpires.setDate(accessExpires.getDate() + 30)
+      
+      db.prepare('UPDATE users SET is_authorized = 1, access_expires = ? WHERE telegram_id = ?').run(accessExpires.toISOString(), userId)
       
       userState.delete(userId)
       
