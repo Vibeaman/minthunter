@@ -104,6 +104,59 @@ async function broadcastToAll(signedTx) {
 }
 
 /**
+ * Send transaction via Flashbots Protect RPC
+ * Goes direct to block builders, skips public mempool
+ * MEV protected - no front-running
+ */
+async function sendViaFlashbots(signedTx) {
+  const flashbotsRpc = 'https://rpc.flashbots.net'
+  
+  console.log('⚡ Sending via Flashbots Protect...')
+  
+  try {
+    const provider = new ethers.JsonRpcProvider(flashbotsRpc, 1, { staticNetwork: true })
+    const tx = await provider.broadcastTransaction(signedTx)
+    console.log(`⚡ Flashbots TX submitted: ${tx.hash}`)
+    return tx
+  } catch (e) {
+    console.log(`⚠️ Flashbots failed: ${e.message}, falling back to regular broadcast`)
+    return broadcastToAll(signedTx)
+  }
+}
+
+/**
+ * FCFS Broadcast - Maximum speed
+ * Sends to both Flashbots AND all regular RPCs simultaneously
+ */
+async function fcfsBroadcast(signedTx) {
+  console.log('🚀 FCFS BROADCAST - Flashbots + All RPCs...')
+  
+  const providers = createAllProviders()
+  const flashbotsProvider = new ethers.JsonRpcProvider('https://rpc.flashbots.net', 1, { staticNetwork: true })
+  
+  // Add Flashbots to the mix
+  const allProviders = [flashbotsProvider, ...providers]
+  
+  console.log(`📡 Broadcasting to ${allProviders.length} endpoints (including Flashbots)...`)
+  
+  const results = await Promise.allSettled(
+    allProviders.map(p => p.broadcastTransaction(signedTx))
+  )
+  
+  // Find first success
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      console.log(`✅ TX broadcast success: ${result.value.hash}`)
+      return result.value
+    }
+  }
+  
+  // All failed
+  const errors = results.map(r => r.reason?.message || 'unknown').join(', ')
+  throw new Error(`All broadcasts failed: ${errors}`)
+}
+
+/**
  * Clear cached provider (use after errors)
  */
 function clearCache() {
@@ -115,6 +168,8 @@ module.exports = {
   getProvider,
   createAllProviders,
   broadcastToAll,
+  sendViaFlashbots,
+  fcfsBroadcast,
   clearCache,
   RPC_ENDPOINTS
 }

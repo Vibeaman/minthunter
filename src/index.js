@@ -9,7 +9,7 @@ const { initDb } = require('./db')
 const db = require('./db')
 const { mainMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
 const { encryptPrivateKey, decryptPrivateKey } = require('./crypto')
-const { getProvider, broadcastToAll } = require('./provider')
+const { getProvider, broadcastToAll, fcfsBroadcast } = require('./provider')
 const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./services/floor')
 const { ethers } = require('ethers')
 
@@ -1220,8 +1220,8 @@ initDb().then(() => {
         
         const signedTx = await signer.signTransaction(txData)
         
-        // Broadcast to all RPCs
-        tx = await broadcastToAll(signedTx)
+        // FCFS Broadcast - Flashbots + All RPCs simultaneously
+        tx = await fcfsBroadcast(signedTx)
         
       } catch (e) {
         // Fallback to regular send
