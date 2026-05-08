@@ -333,6 +333,7 @@ initDb().then(() => {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
+              [{ text: '🔍 SIMULATE', callback_data: `mint_simulate_${jobId}` }],
               [{ text: '🚀 EXECUTE NOW', callback_data: `mint_execute_${jobId}` }],
               [{ text: '❌ Cancel Job', callback_data: `mint_cancel_${jobId}` }],
               [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
@@ -344,6 +345,99 @@ initDb().then(() => {
     }
 
     // Execute mint
+    // ========== SIMULATE MINT ==========
+    if (data.startsWith('mint_simulate_')) {
+      const jobId = parseInt(data.split('_')[2])
+      const job = db.prepare('SELECT * FROM mint_jobs WHERE id = ? AND telegram_id = ?').get(jobId, userId)
+      
+      if (!job) {
+        await bot.sendMessage(chatId, '❌ Job not found.', { reply_markup: mintMenu })
+        return
+      }
+      
+      const wallet = db.prepare('SELECT * FROM wallets WHERE id = ?').get(job.wallet_id)
+      if (!wallet) {
+        await bot.sendMessage(chatId, '❌ Wallet not found.', { reply_markup: mintMenu })
+        return
+      }
+      
+      await bot.sendMessage(chatId, '🔍 Simulating transaction...')
+      
+      try {
+        const provider = await getProvider()
+        const ethPrice = await getEthPrice()
+        
+        // Get current gas price
+        const feeData = await provider.getFeeData()
+        const gasPrice = feeData.gasPrice || ethers.parseUnits('20', 'gwei')
+        
+        // Calculate costs
+        const mintCost = ethers.parseEther(job.mint_price || '0')
+        const gasLimit = BigInt(job.gas_limit)
+        const estimatedGas = gasLimit * gasPrice
+        const fee = job.mint_mode !== 'normal' ? ethers.parseEther(FCFS_FEE) : 0n
+        const totalCost = mintCost + estimatedGas + fee
+        
+        // Get wallet balance
+        const balance = await provider.getBalance(wallet.address)
+        
+        // Format values
+        const mintEth = ethers.formatEther(mintCost)
+        const gasEth = ethers.formatEther(estimatedGas)
+        const feeEth = ethers.formatEther(fee)
+        const totalEth = ethers.formatEther(totalCost)
+        const balanceEth = ethers.formatEther(balance)
+        
+        const mintUsd = (parseFloat(mintEth) * ethPrice).toFixed(2)
+        const gasUsd = (parseFloat(gasEth) * ethPrice).toFixed(2)
+        const feeUsd = (parseFloat(feeEth) * ethPrice).toFixed(2)
+        const totalUsd = (parseFloat(totalEth) * ethPrice).toFixed(2)
+        const balanceUsd = (parseFloat(balanceEth) * ethPrice).toFixed(2)
+        
+        const hasEnough = balance >= totalCost
+        const statusEmoji = hasEnough ? '✅' : '❌'
+        const statusText = hasEnough ? 'Ready to mint!' : 'Insufficient balance'
+        
+        // Gas price in gwei
+        const gasPriceGwei = (Number(gasPrice) / 1e9).toFixed(2)
+        
+        await bot.sendMessage(chatId,
+          `🔍 *Simulation Results*\n\n` +
+          `📝 *Contract:* \`${job.contract_address.slice(0,10)}...\`\n` +
+          `⛓ *Chain:* Ethereum\n` +
+          `⚡ *Mode:* ${job.mint_mode.toUpperCase()}\n\n` +
+          `━━━━━━━━━━━━━━━\n\n` +
+          `💰 *Mint Price:* ${mintEth} ETH (~$${mintUsd})\n` +
+          `⛽ *Gas Fee:* ${gasEth} ETH (~$${gasUsd})\n` +
+          `   └ ${gasPriceGwei} gwei \u00d7 ${gasLimit} limit\n` +
+          (fee > 0n ? `🎯 *Bot Fee:* ${feeEth} ETH (~$${feeUsd})\n` : '') +
+          `\n━━━━━━━━━━━━━━━\n\n` +
+          `💳 *Total Cost:* ${totalEth} ETH (~$${totalUsd})\n` +
+          `👛 *Your Balance:* ${parseFloat(balanceEth).toFixed(4)} ETH (~$${balanceUsd})\n\n` +
+          `${statusEmoji} *${statusText}*`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                hasEnough ? [{ text: '🚀 EXECUTE NOW', callback_data: `mint_execute_${jobId}` }] : [],
+                [{ text: '🔄 Refresh', callback_data: `mint_simulate_${jobId}` }],
+                [{ text: '❌ Cancel Job', callback_data: `mint_cancel_${jobId}` }],
+                [{ text: '🔙 Back', callback_data: 'mint_pending' }]
+              ].filter(row => row.length > 0)
+            }
+          }
+        )
+      } catch (e) {
+        console.error('Simulation error:', e)
+        await bot.sendMessage(chatId,
+          `❌ Simulation failed: ${e.message?.slice(0, 100)}`,
+          { reply_markup: mintMenu }
+        )
+      }
+      return
+    }
+
+    // ========== EXECUTE MINT ==========
     if (data.startsWith('mint_execute_')) {
       const jobId = parseInt(data.split('_')[2])
       const job = db.prepare('SELECT * FROM mint_jobs WHERE id = ? AND telegram_id = ?').get(jobId, userId)
@@ -365,7 +459,7 @@ initDb().then(() => {
         return
       }
       
-      await bot.sendMessage(chatId, '⏳ Preparing mint transaction...')
+      await bot.sendMessage(chatId, '⏳ Executing mint...')
       
       try {
         // Decrypt private key
@@ -618,7 +712,7 @@ initDb().then(() => {
       for (const job of jobs) {
         text += `#${job.id} - \`${job.contract_address.slice(0, 10)}...\` (${job.mint_mode})\n`
         buttons.push([
-          { text: `🚀 Execute #${job.id}`, callback_data: `mint_execute_${job.id}` },
+          { text: `🔍 Simulate #${job.id}`, callback_data: `mint_simulate_${job.id}` },
           { text: `❌ Cancel`, callback_data: `mint_cancel_${job.id}` }
         ])
       }
