@@ -17,6 +17,60 @@ const { ethers } = require('ethers')
 const FEE_WALLET = process.env.FEE_WALLET || '0x1d5dfc070385e6d749707fc94c4af09207d311f9'
 const FCFS_FEE = process.env.FCFS_FEE_ETH || '0.0002'
 
+// Common error messages decoder
+function decodeError(error) {
+  const msg = error?.message?.toLowerCase() || error?.toString()?.toLowerCase() || ''
+  const reason = error?.reason?.toLowerCase() || ''
+  
+  // Sold out / max supply
+  if (msg.includes('sold out') || msg.includes('max supply') || msg.includes('exceeds max') || reason.includes('sold out')) {
+    return '🚨 SOLD OUT - Collection minted out'
+  }
+  
+  // Not live / paused
+  if (msg.includes('not active') || msg.includes('sale not') || msg.includes('paused') || msg.includes('not started') || msg.includes('not live')) {
+    return '⏸️ NOT LIVE - Mint not active yet'
+  }
+  
+  // Whitelist / allowlist
+  if (msg.includes('whitelist') || msg.includes('allowlist') || msg.includes('not eligible') || msg.includes('proof') || msg.includes('merkle')) {
+    return '🚫 NOT WHITELISTED - Address not on allowlist'
+  }
+  
+  // Max per wallet
+  if (msg.includes('max per') || msg.includes('limit reached') || msg.includes('already minted') || msg.includes('exceeds limit')) {
+    return '👛 MAX REACHED - Wallet already minted max allowed'
+  }
+  
+  // Insufficient funds
+  if (msg.includes('insufficient') || msg.includes('not enough') || msg.includes('balance')) {
+    return '💸 INSUFFICIENT FUNDS - Not enough ETH'
+  }
+  
+  // Wrong price
+  if (msg.includes('incorrect') || msg.includes('wrong') || msg.includes('price')) {
+    return '💰 WRONG PRICE - Mint price changed'
+  }
+  
+  // Gas issues
+  if (msg.includes('gas') || msg.includes('underpriced')) {
+    return '⛽ GAS ERROR - Try higher gas boost'
+  }
+  
+  // Nonce
+  if (msg.includes('nonce')) {
+    return '🔄 NONCE ERROR - Transaction conflict, retry'
+  }
+  
+  // Generic revert
+  if (msg.includes('revert') || msg.includes('execution reverted')) {
+    return '❌ REVERTED - Contract rejected transaction'
+  }
+  
+  // Unknown
+  return `❓ ERROR: ${error?.reason || error?.message?.slice(0, 100) || 'Unknown error'}`
+}
+
 // Validate env
 if (!process.env.BOT_TOKEN) {
   console.error('❌ BOT_TOKEN not set in .env')
@@ -322,25 +376,52 @@ initDb().then(() => {
         ? `\n\n💰 Fee: ${FCFS_FEE} ETH (~$${feeUsd})`
         : ''
       
-      await bot.sendMessage(chatId,
-        `✅ *Mint Job Created*\n\n` +
-        `📋 Job #${jobId}\n` +
-        `📍 Contract: \`${state.contract.slice(0, 10)}...\`\n` +
-        `💎 Price: ${state.mintPrice} ETH (~$${mintPriceUsd})\n` +
-        `⚡ Mode: ${state.mode.toUpperCase()}\n` +
-        `⛽ Gas: ${gasLevel}${feeNote}`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '🔍 SIMULATE', callback_data: `mint_simulate_${jobId}` }],
-              [{ text: '🚀 EXECUTE NOW', callback_data: `mint_execute_${jobId}` }],
-              [{ text: '❌ Cancel Job', callback_data: `mint_cancel_${jobId}` }],
-              [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
-            ]
+      // Check if user wants to skip simulation
+      const userSettings = db.prepare('SELECT skip_simulation FROM users WHERE telegram_id = ?').get(userId)
+      const skipSim = userSettings?.skip_simulation === 1
+      
+      if (skipSim) {
+        // YOLO MODE - instant execute
+        await bot.sendMessage(chatId,
+          `⚡ *YOLO MODE - Instant Execute*\n\n` +
+          `📋 Job #${jobId}\n` +
+          `📍 Contract: \`${state.contract.slice(0, 10)}...\`\n` +
+          `💎 Price: ${state.mintPrice} ETH (~$${mintPriceUsd})\n` +
+          `⚡ Mode: ${state.mode.toUpperCase()}\n` +
+          `⛽ Gas: ${gasLevel}${feeNote}\n\n` +
+          `_Executing immediately..._`,
+          { parse_mode: 'Markdown' }
+        )
+        
+        // Trigger execute
+        bot.emit('callback_query', {
+          id: Date.now().toString(),
+          from: { id: userId },
+          message: { chat: { id: chatId } },
+          data: `mint_execute_${jobId}`
+        })
+      } else {
+        // Normal mode - show options
+        await bot.sendMessage(chatId,
+          `✅ *Mint Job Created*\n\n` +
+          `📋 Job #${jobId}\n` +
+          `📍 Contract: \`${state.contract.slice(0, 10)}...\`\n` +
+          `💎 Price: ${state.mintPrice} ETH (~$${mintPriceUsd})\n` +
+          `⚡ Mode: ${state.mode.toUpperCase()}\n` +
+          `⛽ Gas: ${gasLevel}${feeNote}`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '🔍 SIMULATE', callback_data: `mint_simulate_${jobId}` }],
+                [{ text: '🚀 EXECUTE NOW', callback_data: `mint_execute_${jobId}` }],
+                [{ text: '❌ Cancel Job', callback_data: `mint_cancel_${jobId}` }],
+                [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
+              ]
+            }
           }
-        }
-      )
+        )
+      }
       return
     }
 
@@ -623,9 +704,13 @@ initDb().then(() => {
       } catch (err) {
         console.error('Mint error:', err)
         db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', jobId)
+        
+        const errorMsg = decodeError(err)
+        
         await bot.sendMessage(chatId,
-          `❌ *Mint Error*\n\n` +
-          `${err.message?.slice(0, 200) || 'Unknown error'}`,
+          `❌ *Mint Failed*\n\n` +
+          `${errorMsg}\n\n` +
+          `_Raw: ${err.message?.slice(0, 100) || 'Unknown'}_`,
           { parse_mode: 'Markdown', reply_markup: mintMenu }
         )
       }
@@ -879,19 +964,24 @@ initDb().then(() => {
       const slippageStatus = user?.slippage_enabled ? 'ON' : 'OFF'
       const slippageEmoji = user?.slippage_enabled ? '✅' : '❌'
       const gasBoost = user?.gas_boost || 2
+      const skipSimStatus = user?.skip_simulation ? 'ON' : 'OFF'
+      const skipSimEmoji = user?.skip_simulation ? '⚡' : '🔍'
       
       await bot.sendMessage(chatId,
         `⚙️ *Settings*\n\n` +
-        `📉 *Slippage Protection:* ${slippageEmoji} ${slippageStatus}\n` +
-        `⛽ *Gas Boost:* ${gasBoost}x\n\n` +
-        `_Slippage: sends 5% extra ETH on mints._\n` +
-        `_Gas Boost: multiplies gas price for FCFS speed._`,
+        `📉 *Slippage:* ${slippageEmoji} ${slippageStatus}\n` +
+        `⛽ *Gas Boost:* ${gasBoost}x\n` +
+        `⏩ *Skip Simulation:* ${skipSimEmoji} ${skipSimStatus}\n\n` +
+        `_Slippage: sends 5% extra ETH._\n` +
+        `_Gas Boost: multiplies gas for speed._\n` +
+        `_Skip Sim: instant mint, no preview._`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
               [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
               [{ text: `⛽ Gas Boost: ${gasBoost}x`, callback_data: 'menu_gas_boost' }],
+              [{ text: `⏩ Skip Sim: ${skipSimStatus}`, callback_data: 'toggle_skip_sim' }],
               [{ text: '🔙 Back', callback_data: 'menu_main' }]
             ]
           }
@@ -946,25 +1036,72 @@ initDb().then(() => {
     if (data === 'toggle_slippage') {
       const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
       const newValue = user?.slippage_enabled ? 0 : 1
-      const gasBoost = user?.gas_boost || 2
       
       db.prepare('UPDATE users SET slippage_enabled = ? WHERE telegram_id = ?').run(newValue, userId)
       
-      const slippageStatus = newValue ? 'ON' : 'OFF'
-      const slippageEmoji = newValue ? '✅' : '❌'
+      // Refresh settings menu
+      const updatedUser = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      const slippageStatus = updatedUser?.slippage_enabled ? 'ON' : 'OFF'
+      const slippageEmoji = updatedUser?.slippage_enabled ? '✅' : '❌'
+      const gasBoost = updatedUser?.gas_boost || 2
+      const skipSimStatus = updatedUser?.skip_simulation ? 'ON' : 'OFF'
+      const skipSimEmoji = updatedUser?.skip_simulation ? '⚡' : '🔍'
       
       await bot.sendMessage(chatId,
         `⚙️ *Settings*\n\n` +
-        `📉 *Slippage Protection:* ${slippageEmoji} ${slippageStatus}\n` +
-        `⛽ *Gas Boost:* ${gasBoost}x\n\n` +
-        `_Slippage: sends 5% extra ETH on mints._\n` +
-        `_Gas Boost: multiplies gas price for FCFS speed._`,
+        `📉 *Slippage:* ${slippageEmoji} ${slippageStatus}\n` +
+        `⛽ *Gas Boost:* ${gasBoost}x\n` +
+        `⏩ *Skip Simulation:* ${skipSimEmoji} ${skipSimStatus}\n\n` +
+        `_Slippage: sends 5% extra ETH._\n` +
+        `_Gas Boost: multiplies gas for speed._\n` +
+        `_Skip Sim: instant mint, no preview._`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
               [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
               [{ text: `⛽ Gas Boost: ${gasBoost}x`, callback_data: 'menu_gas_boost' }],
+              [{ text: `⏩ Skip Sim: ${skipSimStatus}`, callback_data: 'toggle_skip_sim' }],
+              [{ text: '🔙 Back', callback_data: 'menu_main' }]
+            ]
+          }
+        }
+      )
+      return
+    }
+
+    // Toggle skip simulation
+    if (data === 'toggle_skip_sim') {
+      const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      const newValue = user?.skip_simulation ? 0 : 1
+      
+      db.prepare('UPDATE users SET skip_simulation = ? WHERE telegram_id = ?').run(newValue, userId)
+      
+      // Refresh settings menu
+      const updatedUser = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      const slippageStatus = updatedUser?.slippage_enabled ? 'ON' : 'OFF'
+      const slippageEmoji = updatedUser?.slippage_enabled ? '✅' : '❌'
+      const gasBoost = updatedUser?.gas_boost || 2
+      const skipSimStatus = updatedUser?.skip_simulation ? 'ON' : 'OFF'
+      const skipSimEmoji = updatedUser?.skip_simulation ? '⚡' : '🔍'
+      
+      const warning = newValue ? '\n\n⚠️ *YOLO MODE ENABLED*\nMints will execute instantly without preview!' : ''
+      
+      await bot.sendMessage(chatId,
+        `⚙️ *Settings*${warning}\n\n` +
+        `📉 *Slippage:* ${slippageEmoji} ${slippageStatus}\n` +
+        `⛽ *Gas Boost:* ${gasBoost}x\n` +
+        `⏩ *Skip Simulation:* ${skipSimEmoji} ${skipSimStatus}\n\n` +
+        `_Slippage: sends 5% extra ETH._\n` +
+        `_Gas Boost: multiplies gas for speed._\n` +
+        `_Skip Sim: instant mint, no preview._`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
+              [{ text: `⛽ Gas Boost: ${gasBoost}x`, callback_data: 'menu_gas_boost' }],
+              [{ text: `⏩ Skip Sim: ${skipSimStatus}`, callback_data: 'toggle_skip_sim' }],
               [{ text: '🔙 Back', callback_data: 'menu_main' }]
             ]
           }

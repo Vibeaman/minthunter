@@ -18,6 +18,7 @@ const settingsMenu = {
   inline_keyboard: [
     [{ text: '📉 Slippage: OFF', callback_data: 'toggle_slippage' }],
     [{ text: '⛽ Gas Boost: 2x', callback_data: 'menu_gas_boost' }],
+    [{ text: '⏩ Skip Simulation: OFF', callback_data: 'toggle_skip_sim' }],
     [{ text: '🔙 Back', callback_data: 'menu_main' }]
   ]
 }
