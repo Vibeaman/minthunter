@@ -1463,8 +1463,8 @@ initDb().then(() => {
       const balance = await provider.getBalance(wallet.address)
       const baseMintCost = ethers.parseEther(job.mint_price || '0')
       
-      // Check user's slippage setting
-      const userSettings = db.prepare('SELECT slippage_enabled FROM users WHERE telegram_id = ?').get(job.telegram_id)
+      // Check user settings (slippage + gas boost)
+      const userSettings = db.prepare('SELECT slippage_enabled, gas_boost FROM users WHERE telegram_id = ?').get(job.telegram_id)
       const slippageEnabled = userSettings?.slippage_enabled === 1
       
       // Add 5% slippage buffer if enabled
@@ -1505,8 +1505,7 @@ initDb().then(() => {
       const nonce = await provider.getTransactionCount(wallet.address)
       const feeData = await provider.getFeeData()
       
-      // Get user's gas boost setting
-      const userSettings = db.prepare('SELECT gas_boost FROM users WHERE telegram_id = ?').get(job.telegram_id)
+      // Get gas boost from user settings (already fetched above)
       const gasBoost = BigInt(userSettings?.gas_boost || 2)
       
       // Apply gas boost multiplier
