@@ -7,7 +7,7 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const TelegramBot = require('node-telegram-bot-api')
 const { initDb } = require('./db')
 const db = require('./db')
-const { mainMenu, settingsMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
+const { mainMenu, settingsMenu, gasBoostMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
 const { encryptPrivateKey, decryptPrivateKey } = require('./crypto')
 const { getProvider, broadcastToAll, fcfsBroadcast } = require('./provider')
 const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./services/floor')
@@ -878,18 +878,63 @@ initDb().then(() => {
       const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
       const slippageStatus = user?.slippage_enabled ? 'ON' : 'OFF'
       const slippageEmoji = user?.slippage_enabled ? '✅' : '❌'
+      const gasBoost = user?.gas_boost || 2
       
       await bot.sendMessage(chatId,
         `⚙️ *Settings*\n\n` +
-        `📉 *Slippage Protection:* ${slippageEmoji} ${slippageStatus}\n\n` +
-        `_When ON, sends 5% extra ETH on mints._\n` +
-        `_Most contracts refund excess, some don't._`,
+        `📉 *Slippage Protection:* ${slippageEmoji} ${slippageStatus}\n` +
+        `⛽ *Gas Boost:* ${gasBoost}x\n\n` +
+        `_Slippage: sends 5% extra ETH on mints._\n` +
+        `_Gas Boost: multiplies gas price for FCFS speed._`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
               [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
+              [{ text: `⛽ Gas Boost: ${gasBoost}x`, callback_data: 'menu_gas_boost' }],
               [{ text: '🔙 Back', callback_data: 'menu_main' }]
+            ]
+          }
+        }
+      )
+      return
+    }
+
+    // Gas boost menu
+    if (data === 'menu_gas_boost') {
+      const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      const currentBoost = user?.gas_boost || 2
+      
+      await bot.sendMessage(chatId,
+        `⛽ *Gas Boost Settings*\n\n` +
+        `Current: *${currentBoost}x*\n\n` +
+        `Higher boost = faster inclusion = higher gas cost\n\n` +
+        `• 2x - Default, good for most mints\n` +
+        `• 5x - Fast, competitive FCFS\n` +
+        `• 10x - Turbo, high priority\n` +
+        `• 20x - YOLO, max speed`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: gasBoostMenu
+        }
+      )
+      return
+    }
+
+    // Handle gas boost selection
+    if (data.startsWith('gas_boost_')) {
+      const boost = parseInt(data.replace('gas_boost_', ''))
+      db.prepare('UPDATE users SET gas_boost = ? WHERE telegram_id = ?').run(boost, userId)
+      
+      await bot.sendMessage(chatId,
+        `✅ *Gas Boost set to ${boost}x*\n\n` +
+        `Your FCFS mints will now use ${boost}x gas price for faster inclusion.\n\n` +
+        `⚠️ Higher boost = higher gas fees!`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔙 Back to Settings', callback_data: 'menu_settings' }]
             ]
           }
         }
@@ -901,6 +946,7 @@ initDb().then(() => {
     if (data === 'toggle_slippage') {
       const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
       const newValue = user?.slippage_enabled ? 0 : 1
+      const gasBoost = user?.gas_boost || 2
       
       db.prepare('UPDATE users SET slippage_enabled = ? WHERE telegram_id = ?').run(newValue, userId)
       
@@ -909,14 +955,16 @@ initDb().then(() => {
       
       await bot.sendMessage(chatId,
         `⚙️ *Settings*\n\n` +
-        `📉 *Slippage Protection:* ${slippageEmoji} ${slippageStatus}\n\n` +
-        `_When ON, sends 5% extra ETH on mints._\n` +
-        `_Most contracts refund excess, some don't._`,
+        `📉 *Slippage Protection:* ${slippageEmoji} ${slippageStatus}\n` +
+        `⛽ *Gas Boost:* ${gasBoost}x\n\n` +
+        `_Slippage: sends 5% extra ETH on mints._\n` +
+        `_Gas Boost: multiplies gas price for FCFS speed._`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
               [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
+              [{ text: `⛽ Gas Boost: ${gasBoost}x`, callback_data: 'menu_gas_boost' }],
               [{ text: '🔙 Back', callback_data: 'menu_main' }]
             ]
           }
@@ -1457,9 +1505,15 @@ initDb().then(() => {
       const nonce = await provider.getTransactionCount(wallet.address)
       const feeData = await provider.getFeeData()
       
-      // Use 2x gas price for speed
-      const maxFeePerGas = feeData.maxFeePerGas ? feeData.maxFeePerGas * 2n : ethers.parseUnits('100', 'gwei')
-      const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ? feeData.maxPriorityFeePerGas * 2n : ethers.parseUnits('5', 'gwei')
+      // Get user's gas boost setting
+      const userSettings = db.prepare('SELECT gas_boost FROM users WHERE telegram_id = ?').get(job.telegram_id)
+      const gasBoost = BigInt(userSettings?.gas_boost || 2)
+      
+      // Apply gas boost multiplier
+      const maxFeePerGas = feeData.maxFeePerGas ? feeData.maxFeePerGas * gasBoost : ethers.parseUnits('100', 'gwei') * gasBoost
+      const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ? feeData.maxPriorityFeePerGas * gasBoost : ethers.parseUnits('5', 'gwei') * gasBoost
+      
+      console.log(`⛽ Gas boost: ${gasBoost}x | maxFee: ${ethers.formatUnits(maxFeePerGas, 'gwei')} gwei`)
       
       // Try multiple mint functions simultaneously
       const mintSelectors = [

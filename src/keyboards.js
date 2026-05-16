@@ -17,7 +17,19 @@ const mainMenu = {
 const settingsMenu = {
   inline_keyboard: [
     [{ text: '📉 Slippage: OFF', callback_data: 'toggle_slippage' }],
+    [{ text: '⛽ Gas Boost: 2x', callback_data: 'menu_gas_boost' }],
     [{ text: '🔙 Back', callback_data: 'menu_main' }]
+  ]
+}
+
+// Gas boost menu
+const gasBoostMenu = {
+  inline_keyboard: [
+    [{ text: '2x (Default)', callback_data: 'gas_boost_2' }],
+    [{ text: '5x (Fast)', callback_data: 'gas_boost_5' }],
+    [{ text: '10x (Turbo)', callback_data: 'gas_boost_10' }],
+    [{ text: '20x (YOLO)', callback_data: 'gas_boost_20' }],
+    [{ text: '🔙 Back', callback_data: 'menu_settings' }]
   ]
 }
 
@@ -99,6 +111,7 @@ const backToMain = {
 module.exports = {
   mainMenu,
   settingsMenu,
+  gasBoostMenu,
   alertsMenu,
   mintMenu,
   walletsMenu,

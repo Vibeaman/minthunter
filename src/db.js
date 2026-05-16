@@ -131,6 +131,13 @@ async function initDb() {
     // Column already exists
   }
 
+  // Add gas_boost column to users (migration) - default 2x
+  try {
+    db.run('ALTER TABLE users ADD COLUMN gas_boost INTEGER DEFAULT 2')
+  } catch (e) {
+    // Column already exists
+  }
+
   // Reset all existing users to unauthorized
   db.run('UPDATE users SET is_authorized = 0')
 
