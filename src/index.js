@@ -1610,17 +1610,36 @@ initDb().then(() => {
         : baseMintCost
       
       const fee = ethers.parseEther(FCFS_FEE)
-      const gasEstimate = BigInt(job.gas_limit) * ethers.parseUnits('100', 'gwei') // High gas for speed
+      
+      // Get actual gas price from network
+      const feeData = await provider.getFeeData()
+      const currentGasPrice = feeData.gasPrice || ethers.parseUnits('30', 'gwei')
+      const gasBoostMultiplier = BigInt(userSettings?.gas_boost || 2)
+      const boostedGasPrice = currentGasPrice * gasBoostMultiplier
+      const gasEstimate = BigInt(job.gas_limit) * boostedGasPrice
+      
       const totalNeeded = mintCost + fee + gasEstimate
       
+      // Debug log
+      const ethPrice = await getEthPrice()
+      console.log(`Balance check for job #${job.id}:`)
+      console.log(`  Balance: ${ethers.formatEther(balance)} ETH`)
+      console.log(`  Mint cost: ${ethers.formatEther(mintCost)} ETH`)
+      console.log(`  Fee: ${ethers.formatEther(fee)} ETH`)
+      console.log(`  Gas estimate: ${ethers.formatEther(gasEstimate)} ETH (${ethers.formatUnits(boostedGasPrice, 'gwei')} gwei x ${job.gas_limit})`)
+      console.log(`  Total needed: ${ethers.formatEther(totalNeeded)} ETH`)
+      
       if (balance < totalNeeded) {
-        const ethPrice = await getEthPrice()
         const shortfall = ethers.formatEther(totalNeeded - balance)
         const shortUsd = (parseFloat(shortfall) * ethPrice).toFixed(2)
+        const balanceUsd = (parseFloat(ethers.formatEther(balance)) * ethPrice).toFixed(2)
+        const neededUsd = (parseFloat(ethers.formatEther(totalNeeded)) * ethPrice).toFixed(2)
         await bot.sendMessage(chatId,
           `❌ *Scheduled Mint #${job.id} Failed*\n\n` +
-          `Insufficient balance!\n` +
-          `Short: ${shortfall} ETH (~$${shortUsd})`,
+          `Insufficient balance!\n\n` +
+          `💰 Need: ${parseFloat(ethers.formatEther(totalNeeded)).toFixed(4)} ETH (~$${neededUsd})\n` +
+          `👛 Have: ${parseFloat(ethers.formatEther(balance)).toFixed(4)} ETH (~$${balanceUsd})\n` +
+          `📉 Short: ${parseFloat(shortfall).toFixed(4)} ETH (~$${shortUsd})`,
           { parse_mode: 'Markdown' }
         )
         db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', job.id)
