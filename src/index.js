@@ -1612,8 +1612,8 @@ initDb().then(() => {
       const fee = ethers.parseEther(FCFS_FEE)
       
       // Get actual gas price from network
-      const feeData = await provider.getFeeData()
-      const currentGasPrice = feeData.gasPrice || ethers.parseUnits('30', 'gwei')
+      const balanceCheckFeeData = await provider.getFeeData()
+      const currentGasPrice = balanceCheckFeeData.gasPrice || ethers.parseUnits('30', 'gwei')
       const gasBoostMultiplier = BigInt(userSettings?.gas_boost || 2)
       const boostedGasPrice = currentGasPrice * gasBoostMultiplier
       const gasEstimate = BigInt(job.gas_limit) * boostedGasPrice
