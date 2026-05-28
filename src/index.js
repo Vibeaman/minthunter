@@ -11,6 +11,7 @@ const { mainMenu, settingsMenu, gasBoostMenu, walletsMenu, mintMenu, mintModeMen
 const { encryptPrivateKey, decryptPrivateKey } = require('./crypto')
 const { getProvider, broadcastToAll, fcfsBroadcast } = require('./provider')
 const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./services/floor')
+const { analyzeContract, buildMintData } = require('./services/contract')
 const { ethers } = require('ethers')
 
 // Fee config
@@ -325,12 +326,18 @@ initDb().then(() => {
       
       let modeText = mode === 'fcfs' ? '⚡ FCFS' : mode === 'snipe' ? '🎯 Snipe' : '🐢 Normal'
       
-      await bot.sendMessage(chatId,
-        `⚡ *Mint Mode: ${modeText}*\n\n` +
-        `Send the mint price in ETH (e.g., 0.05)\n\n` +
-        `Send \`0\` for free mints.`,
-        { parse_mode: 'Markdown' }
-      )
+      // Check if we detected a price
+      let pricePrompt = `⚡ *Mint Mode: ${modeText}*\n\n`
+      
+      if (state.detectedPrice !== undefined && state.detectedPrice !== null) {
+        pricePrompt += `💰 Detected price: *${state.detectedPrice} ETH*\n\n`
+        pricePrompt += `Press Enter or send the price to confirm, or enter a different price.\n\n`
+      }
+      
+      pricePrompt += `Send the mint price in ETH (e.g., 0.05)\n`
+      pricePrompt += `Send \`0\` for free mints.`
+      
+      await bot.sendMessage(chatId, pricePrompt, { parse_mode: 'Markdown' })
       return
     }
 
@@ -349,14 +356,18 @@ initDb().then(() => {
       // Create the mint job
       const gasMultiplier = gasLevel === 'aggressive' ? 1.5 : gasLevel === 'fast' ? 1.2 : 1.0
       
+      // Store detected mint function if available
+      const mintFunctionJson = state.detectedMintFn ? JSON.stringify(state.detectedMintFn) : null
+      
       const result = db.prepare(`
         INSERT INTO mint_jobs 
-        (telegram_id, wallet_id, contract_address, mint_price, mint_mode, gas_limit, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        (telegram_id, wallet_id, contract_address, mint_function, mint_price, mint_mode, gas_limit, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
       `).run(
         userId,
         state.walletId,
         state.contract,
+        mintFunctionJson,
         state.mintPrice,
         state.mode,
         Math.floor(250000 * gasMultiplier)
@@ -606,72 +617,100 @@ initDb().then(() => {
         await bot.sendMessage(chatId, '🔨 Building mint transaction...')
         
         // Try common mint functions (expanded list)
-        const mintFunctions = [
-          // Standard mint
-          'mint()',
-          'mint(uint256)',
-          'mint(address)',
-          'mint(address,uint256)',
-          // Public mint
-          'publicMint()',
-          'publicMint(uint256)',
-          'publicSaleMint()',
-          'publicSaleMint(uint256)',
-          // Free mint
-          'freeMint()',
-          'freeMint(uint256)',
-          'mintFree()',
-          'mintFree(uint256)',
-          'claim()',
-          'claim(uint256)',
-          'claimFree()',
-          // NFT variations
-          'mintNFT()',
-          'mintNFT(uint256)',
-          'mintNFTs(uint256)',
-          // Other common names
-          'safeMint()',
-          'safeMint(address)',
-          'purchase()',
-          'purchase(uint256)',
-          'buy()',
-          'buy(uint256)'
-        ]
-        
-        const contract = new ethers.Contract(
-          job.contract_address,
-          mintFunctions.map(fn => `function ${fn} payable`),
-          signer
-        )
-        
         let tx
         let success = false
         
-        for (const fn of mintFunctions) {
+        // Check if we have a detected mint function from contract analysis
+        const detectedFn = job.mint_function ? JSON.parse(job.mint_function) : null
+        
+        if (detectedFn) {
+          // Use the detected function directly
+          console.log(`🎯 Using detected mint function: ${detectedFn.signature}`)
+          await bot.sendMessage(chatId, `🎯 Using detected: \`${detectedFn.signature}\``, { parse_mode: 'Markdown' })
+          
           try {
-            const fnName = fn.split('(')[0]
-            const hasParam = fn.includes('uint256')
-            
-            if (hasParam) {
-              tx = await contract[fnName](1, { 
+            const mintData = buildMintData(detectedFn, 1, wallet.address)
+            if (mintData) {
+              tx = await signer.sendTransaction({
+                to: job.contract_address,
                 value: mintCost,
-                gasLimit: job.gas_limit
+                gasLimit: job.gas_limit,
+                data: mintData
               })
-            } else {
-              tx = await contract[fnName]({ 
-                value: mintCost,
-                gasLimit: job.gas_limit
-              })
+              success = true
             }
-            success = true
-            break
           } catch (e) {
-            continue
+            console.log(`Detected function failed: ${e.message}, falling back...`)
+          }
+        }
+        
+        // Fallback to trying common functions
+        if (!success) {
+          const mintFunctions = [
+            // Standard mint
+            'mint()',
+            'mint(uint256)',
+            'mint(address)',
+            'mint(address,uint256)',
+            // Public mint
+            'publicMint()',
+            'publicMint(uint256)',
+            'publicSaleMint()',
+            'publicSaleMint(uint256)',
+            // Free mint
+            'freeMint()',
+            'freeMint(uint256)',
+            'mintFree()',
+            'mintFree(uint256)',
+            'claim()',
+            'claim(uint256)',
+            'claimFree()',
+            // NFT variations
+            'mintNFT()',
+            'mintNFT(uint256)',
+            'mintNFTs(uint256)',
+            // Other common names
+            'safeMint()',
+            'safeMint(address)',
+            'purchase()',
+            'purchase(uint256)',
+            'buy()',
+            'buy(uint256)'
+          ]
+          
+          const contract = new ethers.Contract(
+            job.contract_address,
+            mintFunctions.map(fn => `function ${fn} payable`),
+            signer
+          )
+          
+          for (const fn of mintFunctions) {
+            try {
+              const fnName = fn.split('(')[0]
+              const hasParam = fn.includes('uint256')
+              
+              if (hasParam) {
+                tx = await contract[fnName](1, { 
+                  value: mintCost,
+                  gasLimit: job.gas_limit
+                })
+              } else {
+                tx = await contract[fnName]({ 
+                  value: mintCost,
+                  gasLimit: job.gas_limit
+                })
+              }
+              success = true
+              console.log(`✅ Mint succeeded with: ${fn}`)
+              break
+            } catch (e) {
+              continue
+            }
           }
         }
         
         if (!success) {
-          // Try raw call as fallback
+          // Try raw call as last resort
           tx = await signer.sendTransaction({
             to: job.contract_address,
             value: mintCost,
@@ -1487,6 +1526,45 @@ initDb().then(() => {
       }
       
       state.contract = contract
+      
+      // Analyze contract for mint functions and price
+      await bot.sendMessage(chatId, '🔍 Analyzing contract...')
+      
+      try {
+        const provider = await getProvider()
+        const analysis = await analyzeContract(contract, provider)
+        
+        state.contractAnalysis = analysis
+        
+        let analysisMsg = ''
+        if (analysis.verified) {
+          analysisMsg = '✅ *Contract Verified*\n\n'
+          
+          if (analysis.recommendedMint) {
+            analysisMsg += `🎯 Detected mint: \`${analysis.recommendedMint.signature}\`\n`
+            state.detectedMintFn = analysis.recommendedMint
+          }
+          
+          if (analysis.detectedPrice !== null) {
+            const priceEth = ethers.formatEther(analysis.detectedPrice)
+            analysisMsg += `💰 Detected price: ${priceEth} ETH\n`
+            state.detectedPrice = priceEth
+          }
+          
+          if (analysis.mintFunctions.length > 1) {
+            analysisMsg += `\n📋 Found ${analysis.mintFunctions.length} mint functions`
+          }
+        } else {
+          analysisMsg = '⚠️ *Contract Not Verified*\n\nWill try common mint functions.'
+        }
+        
+        await bot.sendMessage(chatId, analysisMsg, { parse_mode: 'Markdown' })
+        
+      } catch (e) {
+        console.error('Contract analysis error:', e.message)
+        await bot.sendMessage(chatId, '⚠️ Could not analyze contract. Will try common mint functions.')
+      }
+      
       state.step = 'mint_mode'
       userState.set(userId, state)
       
@@ -1699,24 +1777,17 @@ initDb().then(() => {
       
       console.log(`⛽ Gas boost: ${gasBoost}x | maxFee: ${ethers.formatUnits(maxFeePerGas, 'gwei')} gwei`)
       
-      // Try multiple mint functions simultaneously (common selectors)
-      const mintSelectors = [
-        '0x1249c58b', // mint()
-        '0xa0712d68', // mint(uint256)
-        '0x40c10f19', // mint(address,uint256)
-        '0x6a627842', // mint(address)
-        '0x2db11544', // publicMint(uint256)
-        '0x26092b83', // publicMint()
-        '0x84bb1e42', // freeMint(uint256)
-        '0x5b70ea9f', // freeMint()
-        '0x4e71d92d', // claim()
-        '0x379607f5', // claim(uint256)
-        '0xa6f2ae3a', // buy()
-        '0xd96a094a', // buy(uint256)
-      ]
+      // Check for detected mint function
+      const detectedFn = job.mint_function ? JSON.parse(job.mint_function) : null
       
-      // Try mint() first (most common)
       let tx
+      let mintData = '0x1249c58b' // default: mint()
+      
+      if (detectedFn) {
+        console.log(`🎯 Scheduled mint using detected: ${detectedFn.signature}`)
+        mintData = buildMintData(detectedFn, 1, wallet.address) || mintData
+      }
+      
       try {
         const txData = {
           to: job.contract_address,
@@ -1725,7 +1796,7 @@ initDb().then(() => {
           maxFeePerGas,
           maxPriorityFeePerGas,
           nonce,
-          data: '0x1249c58b' // mint()
+          data: mintData
         }
         
         const signedTx = await signer.signTransaction(txData)
