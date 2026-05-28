@@ -11,6 +11,7 @@
     "node-telegram-bot-api": "^0.66.0",
     "ethers": "^6.16.0",
     "sql.js": "^1.11.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "axios": "^1.7.2"
   }
 }
