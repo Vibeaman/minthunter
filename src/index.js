@@ -605,14 +605,37 @@ initDb().then(() => {
         // Build mint transaction
         await bot.sendMessage(chatId, '🔨 Building mint transaction...')
         
-        // Try common mint functions
+        // Try common mint functions (expanded list)
         const mintFunctions = [
+          // Standard mint
           'mint()',
           'mint(uint256)',
+          'mint(address)',
+          'mint(address,uint256)',
+          // Public mint
           'publicMint()',
           'publicMint(uint256)',
+          'publicSaleMint()',
+          'publicSaleMint(uint256)',
+          // Free mint
+          'freeMint()',
+          'freeMint(uint256)',
+          'mintFree()',
+          'mintFree(uint256)',
+          'claim()',
+          'claim(uint256)',
+          'claimFree()',
+          // NFT variations
           'mintNFT()',
-          'mintNFT(uint256)'
+          'mintNFT(uint256)',
+          'mintNFTs(uint256)',
+          // Other common names
+          'safeMint()',
+          'safeMint(address)',
+          'purchase()',
+          'purchase(uint256)',
+          'buy()',
+          'buy(uint256)'
         ]
         
         const contract = new ethers.Contract(
@@ -1676,12 +1699,20 @@ initDb().then(() => {
       
       console.log(`⛽ Gas boost: ${gasBoost}x | maxFee: ${ethers.formatUnits(maxFeePerGas, 'gwei')} gwei`)
       
-      // Try multiple mint functions simultaneously
+      // Try multiple mint functions simultaneously (common selectors)
       const mintSelectors = [
         '0x1249c58b', // mint()
-        '0xa0712d68', // mint(uint256) - will need encoding
+        '0xa0712d68', // mint(uint256)
         '0x40c10f19', // mint(address,uint256)
         '0x6a627842', // mint(address)
+        '0x2db11544', // publicMint(uint256)
+        '0x26092b83', // publicMint()
+        '0x84bb1e42', // freeMint(uint256)
+        '0x5b70ea9f', // freeMint()
+        '0x4e71d92d', // claim()
+        '0x379607f5', // claim(uint256)
+        '0xa6f2ae3a', // buy()
+        '0xd96a094a', // buy(uint256)
       ]
       
       // Try mint() first (most common)
