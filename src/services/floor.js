@@ -1,275 +1,214 @@
-/**
- * Floor Price Service
- * Fetches NFT collection floor prices and checks alerts
- */
-
 const https = require('https')
+const path = require('path')
+const { ethers } = require('ethers')
+require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') })
 
-// Load Alchemy API key from env
-require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env') })
-const ALCHEMY_API_KEY = process.env.ALCHEMY_RPC?.split('/').pop() || ''
+const ALCHEMY_API_KEY = (() => {
+  try {
+    const url = new URL(process.env.ALCHEMY_RPC || '')
+    return url.hostname.endsWith('alchemy.com') ? url.pathname.split('/').pop() : ''
+  } catch {
+    return ''
+  }
+})()
+const SIMPLEHASH_API_KEY = process.env.SIMPLEHASH_API_KEY || ''
+const ETH_PRICE_CACHE_TTL = 5 * 60 * 1000
+const TRENDING_CACHE_TTL = 10 * 60 * 1000
+const TOP_ETHEREUM_COLLECTIONS = [
+  'bored-ape-yacht-club',
+  'cryptopunks',
+  'mutant-ape-yacht-club',
+  'azuki',
+  'pudgy-penguins',
+  'milady-maker',
+  'doodles-official',
+  'clonex',
+  'moonbirds',
+]
 
-/**
- * Fetch floor price from Alchemy NFT API
- * Falls back to SimpleHash if needed
- */
+let cachedEthPrice = null
+let ethPriceCacheTime = 0
+let trendingCache = null
+let trendingCacheTime = 0
+
 async function getFloorPrice(contractAddress) {
-  // Try Alchemy NFT API first (you have a key)
+  if (!ethers.isAddress(contractAddress)) return null
+  const address = ethers.getAddress(contractAddress)
+
   if (ALCHEMY_API_KEY) {
     try {
       const data = await fetchJson(
-        `https://eth-mainnet.g.alchemy.com/nft/v3/${ALCHEMY_API_KEY}/getFloorPrice?contractAddress=${contractAddress}`
+        `https://eth-mainnet.g.alchemy.com/nft/v3/${encodeURIComponent(ALCHEMY_API_KEY)}/getFloorPrice?contractAddress=${address}`,
       )
-      
-      if (data?.openSea?.floorPrice || data?.looksRare?.floorPrice) {
-        const floor = data.openSea?.floorPrice || data.looksRare?.floorPrice || 0
-        return {
-          floor: floor,
-          name: data.openSea?.collectionName || 'Unknown',
-          symbol: '',
-          source: 'alchemy'
-        }
+      const floor = data?.openSea?.floorPrice ?? data?.looksRare?.floorPrice
+      if (typeof floor === 'number' && Number.isFinite(floor)) {
+        return { floor, name: data.openSea?.collectionName || 'Unknown', symbol: '', source: 'alchemy' }
       }
-    } catch (e) {
-      console.log(`Alchemy error for ${contractAddress}: ${e.message}`)
+    } catch (error) {
+      console.error(`Alchemy floor error for ${address}: ${error.message}`)
     }
   }
-  
-  // Fallback: SimpleHash free tier
+
+  if (!SIMPLEHASH_API_KEY) return null
   try {
     const data = await fetchJson(
-      `https://api.simplehash.com/api/v0/nfts/collections/ethereum/${contractAddress}`,
-      { 'X-API-KEY': '' }
+      `https://api.simplehash.com/api/v0/nfts/collections/ethereum/${address}`,
+      { 'X-API-KEY': SIMPLEHASH_API_KEY },
     )
-    
-    if (data?.floor_prices?.[0]) {
+    const floor = data?.floor_prices?.[0]?.value
+    if (typeof floor === 'number' && Number.isFinite(floor)) {
       return {
-        floor: data.floor_prices[0].value / 1e18 || 0,
+        floor: floor / 1e18,
         name: data.name || 'Unknown',
         symbol: data.symbol || '',
-        source: 'simplehash'
+        source: 'simplehash',
       }
     }
-  } catch (e) {
-    console.log(`SimpleHash error for ${contractAddress}: ${e.message}`)
+  } catch (error) {
+    console.error(`SimpleHash floor error for ${address}: ${error.message}`)
   }
-  
+
   return null
 }
 
-/**
- * Check all active alerts against current floor prices
- * Returns array of triggered alerts
- */
 async function checkAlerts(db, bot) {
   const alerts = db.prepare(`
-    SELECT fa.*, u.telegram_id 
+    SELECT fa.*, u.telegram_id
     FROM floor_alerts fa
     JOIN users u ON fa.telegram_id = u.telegram_id
     WHERE fa.is_active = 1
+      AND u.is_authorized = 1
+      AND (u.access_expires IS NULL OR datetime(u.access_expires) > datetime('now'))
   `).all()
-  
   if (alerts.length === 0) return []
-  
-  console.log(`🔔 Checking ${alerts.length} floor alerts...`)
-  
+
   const triggered = []
-  
-  // Group by collection to avoid duplicate API calls
-  const collections = {}
+  const collections = new Map()
   for (const alert of alerts) {
-    if (!collections[alert.collection_address]) {
-      collections[alert.collection_address] = []
+    if (!ethers.isAddress(alert.collection_address)) {
+      console.error(`Skipping invalid alert address for alert #${alert.id}`)
+      continue
     }
-    collections[alert.collection_address].push(alert)
+    const address = ethers.getAddress(alert.collection_address)
+    if (!collections.has(address)) collections.set(address, [])
+    collections.get(address).push(alert)
   }
-  
-  for (const [address, alertsForCollection] of Object.entries(collections)) {
+
+  for (const [address, collectionAlerts] of collections) {
     try {
       const priceData = await getFloorPrice(address)
-      
-      if (!priceData || !priceData.floor) {
-        console.log(`⚠️ Could not get floor for ${address}`)
-        continue
+      if (!priceData || priceData.floor == null) continue
+      const currentFloor = Number(priceData.floor)
+      if (!Number.isFinite(currentFloor)) continue
+
+      for (const alert of collectionAlerts) {
+        const target = Number(alert.target_price)
+        const shouldTrigger = alert.condition === 'below'
+          ? currentFloor <= target
+          : alert.condition === 'above' && currentFloor >= target
+        if (!shouldTrigger) continue
+
+        const symbol = alert.condition === 'below' ? '📉' : '📈'
+        await bot.sendMessage(alert.telegram_id,
+          `🚨 *Floor Alert Triggered!*\n\n` +
+          `${symbol} *${collectionName(priceData.name)}*\n\n` +
+          `Current floor: *${currentFloor.toFixed(4)} ETH*\n` +
+          `Your target: ${alert.condition} ${alert.target_price} ETH\n\n` +
+          `Contract: \`${address.slice(0, 10)}...\``,
+          { parse_mode: 'Markdown' },
+        )
+        db.prepare('UPDATE floor_alerts SET is_active = 0 WHERE id = ? AND is_active = 1').run(alert.id)
+        triggered.push({ alert, currentFloor, collectionName: priceData.name })
       }
-      
-      const currentFloor = parseFloat(priceData.floor)
-      
-      for (const alert of alertsForCollection) {
-        const target = parseFloat(alert.target_price)
-        let shouldTrigger = false
-        
-        if (alert.condition === 'below' && currentFloor < target) {
-          shouldTrigger = true
-        } else if (alert.condition === 'above' && currentFloor > target) {
-          shouldTrigger = true
-        }
-        
-        if (shouldTrigger) {
-          triggered.push({
-            alert,
-            currentFloor,
-            collectionName: priceData.name
-          })
-          
-          // Send notification
-          const symbol = alert.condition === 'below' ? '📉' : '📈'
-          await bot.sendMessage(alert.telegram_id,
-            `🚨 *Floor Alert Triggered!*\n\n` +
-            `${symbol} *${priceData.name}*\n\n` +
-            `Current floor: *${currentFloor.toFixed(4)} ETH*\n` +
-            `Your target: ${alert.condition} ${alert.target_price} ETH\n\n` +
-            `Contract: \`${address.slice(0, 10)}...\``,
-            { parse_mode: 'Markdown' }
-          )
-          
-          // Deactivate alert after triggering (one-time)
-          db.prepare('UPDATE floor_alerts SET is_active = 0 WHERE id = ?').run(alert.id)
-          console.log(`🚨 Alert #${alert.id} triggered! Floor: ${currentFloor} ETH`)
-        }
-      }
-      
-      // Rate limit between collections
       await sleep(500)
-      
-    } catch (e) {
-      console.error(`Error checking ${address}:`, e.message)
+    } catch (error) {
+      console.error(`Alert check error for ${address}: ${error.message}`)
     }
   }
-  
+
   return triggered
 }
 
-/**
- * Get trending collections (top NFTs)
- * Fetches individual popular collections from CoinGecko
- */
 async function getTrending() {
-  // Top NFT collection IDs on CoinGecko (curated list)
-  const topCollections = [
-    'bored-ape-yacht-club',
-    'cryptopunks',
-    'mutant-ape-yacht-club',
-    'azuki',
-    'pudgy-penguins',
-    'milady-maker',
-    'doodles-official',
-    'clonex',
-    'degods-solana', 
-    'moonbirds'
-  ]
-  
+  if (trendingCache && Date.now() - trendingCacheTime < TRENDING_CACHE_TTL) return trendingCache
   const results = []
-  
-  for (const id of topCollections) {
+  for (const id of TOP_ETHEREUM_COLLECTIONS) {
     try {
-      const data = await fetchJson(
-        `https://api.coingecko.com/api/v3/nfts/${id}`
-      )
-      
-      if (data && data.name) {
+      const data = await fetchJson(`https://api.coingecko.com/api/v3/nfts/${id}`)
+      if (data?.name) {
         results.push({
-          name: data.name || 'Unknown',
+          name: data.name,
           floor: data.floor_price?.native_currency || 0,
           floorUsd: data.floor_price?.usd || 0,
           volume24h: data.volume_24h?.native_currency || 0,
           change24h: data.floor_price_24h_percentage_change?.native_currency || 0,
-          address: data.contract_address
+          address: data.contract_address,
         })
       }
-      
-      // Rate limit - CoinGecko free tier is 10-30 req/min
-      await sleep(350)
-      
-    } catch (e) {
-      console.log(`Failed to fetch ${id}:`, e.message)
-      continue
+      await sleep(500)
+    } catch (error) {
+      console.error(`Trending fetch failed for ${id}: ${error.message}`)
     }
   }
-  
-  // Sort by 24h volume descending
   results.sort((a, b) => (b.volume24h || 0) - (a.volume24h || 0))
-  
+  trendingCache = results
+  trendingCacheTime = Date.now()
   return results
 }
 
-// Helper: fetch JSON
-function fetchJson(url, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url)
-    
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'MintHunter/1.0',
-        ...headers
-      }
+async function getEthPrice() {
+  if (cachedEthPrice && Date.now() - ethPriceCacheTime < ETH_PRICE_CACHE_TTL) return cachedEthPrice
+  try {
+    const data = await fetchJson('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd')
+    const price = Number(data?.ethereum?.usd)
+    if (Number.isFinite(price) && price > 0) {
+      cachedEthPrice = price
+      ethPriceCacheTime = Date.now()
+      return price
     }
-    
-    const req = https.request(options, (res) => {
-      let data = ''
-      res.on('data', chunk => data += chunk)
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data))
-        } catch (e) {
-          reject(new Error('Invalid JSON response'))
-        }
+  } catch (error) {
+    console.error(`ETH price fetch error: ${error.message}`)
+  }
+  return cachedEthPrice
+}
+
+function collectionName(value) {
+  return String(value || 'Unknown').replace(/[\\*_`]/g, '')
+}
+
+function fetchJson(url, headers = {}, attempts = 3) {
+  return new Promise((resolve, reject) => {
+    const request = () => {
+      const urlObj = new URL(url)
+      const req = https.request(urlObj, {
+        method: 'GET',
+        headers: { Accept: 'application/json', 'User-Agent': 'MintHunter/1.0', ...headers },
+      }, (res) => {
+        let data = ''
+        res.setEncoding('utf8')
+        res.on('data', (chunk) => { data += chunk })
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            const error = new Error(`HTTP ${res.statusCode}`)
+            if (attempts > 1 && res.statusCode >= 500) return setTimeout(() => fetchJson(url, headers, attempts - 1).then(resolve, reject), 500)
+            return reject(error)
+          }
+          try { resolve(JSON.parse(data)) } catch { reject(new Error('Invalid JSON response')) }
+        })
       })
-    })
-    
-    req.on('error', reject)
-    req.setTimeout(10000, () => {
-      req.destroy()
-      reject(new Error('Request timeout'))
-    })
-    req.end()
+      req.setTimeout(10_000, () => req.destroy(new Error('Request timeout')))
+      req.on('error', (error) => {
+        if (attempts > 1) return setTimeout(() => fetchJson(url, headers, attempts - 1).then(resolve, reject), 500)
+        reject(error)
+      })
+      req.end()
+    }
+    request()
   })
 }
 
-// Helper: sleep
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-// Cache ETH price (refresh every 5 min)
-let cachedEthPrice = null
-let ethPriceCacheTime = 0
-const ETH_PRICE_CACHE_TTL = 5 * 60 * 1000
-
-/**
- * Get current ETH price in USD
- */
-async function getEthPrice() {
-  // Return cached if fresh
-  if (cachedEthPrice && (Date.now() - ethPriceCacheTime) < ETH_PRICE_CACHE_TTL) {
-    return cachedEthPrice
-  }
-  
-  try {
-    const data = await fetchJson(
-      'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd'
-    )
-    
-    if (data?.ethereum?.usd) {
-      cachedEthPrice = data.ethereum.usd
-      ethPriceCacheTime = Date.now()
-      return cachedEthPrice
-    }
-  } catch (e) {
-    console.log('ETH price fetch error:', e.message)
-  }
-  
-  // Fallback to cached or default
-  return cachedEthPrice || 2500
-}
-
-module.exports = {
-  getFloorPrice,
-  checkAlerts,
-  getTrending,
-  getEthPrice
-}
+module.exports = { checkAlerts, getEthPrice, getFloorPrice, getTrending }

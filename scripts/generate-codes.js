@@ -1,67 +1,43 @@
 /**
- * Generate access codes for MintHunter
+ * Generate MintHunter access codes.
  * Usage: node scripts/generate-codes.js [count] [days]
+ * Codes are printed to stdout only; they are never written into the repository.
  */
 
+const crypto = require('crypto')
 const { initDb } = require('../src/db')
 const db = require('../src/db')
-const crypto = require('crypto')
 
 async function generateCodes(count = 30, days = 30) {
+  if (!Number.isInteger(count) || count < 1 || count > 10_000) {
+    throw new Error('count must be an integer between 1 and 10000')
+  }
+  if (!Number.isInteger(days) || days < 1 || days > 3650) {
+    throw new Error('days must be an integer between 1 and 3650')
+  }
+
   await initDb()
-  
   const codes = []
-  const expiresAt = new Date()
-  expiresAt.setDate(expiresAt.getDate() + days)
-  
-  console.log(`\n🔑 Generating ${count} access codes (valid for ${days} days)\n`)
-  console.log(`Expires: ${expiresAt.toISOString().split('T')[0]}\n`)
-  console.log('─'.repeat(40))
-  
-  for (let i = 0; i < count; i++) {
-    // Generate code: MH-XXXXXX (6 chars)
-    const random = crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6)
-    const code = `MH-${random}`
-    
+  const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000)
+
+  while (codes.length < count) {
+    const code = `MH-${crypto.randomBytes(4).toString('hex').slice(0, 6).toUpperCase()}`
     try {
-      db.prepare(`
-        INSERT INTO access_codes (code, expires_at) VALUES (?, ?)
-      `).run(code, expiresAt.toISOString())
-      
+      db.prepare('INSERT INTO access_codes (code, expires_at) VALUES (?, ?)').run(code, expiresAt.toISOString())
       codes.push(code)
-      console.log(`${i + 1}. ${code}`)
-    } catch (e) {
-      // Code collision, try again
-      i--
-      continue
+    } catch (error) {
+      if (!String(error.message).toLowerCase().includes('unique')) throw error
     }
   }
-  
-  console.log('─'.repeat(40))
-  console.log(`\n✅ Generated ${codes.length} codes\n`)
-  
-  // Save to file too
-  const fs = require('fs')
-  const path = require('path')
-  const filename = `access-codes-${Date.now()}.txt`
-  const filepath = path.join(__dirname, '..', filename)
-  
-  const content = [
-    `MintHunter Access Codes`,
-    `Generated: ${new Date().toISOString()}`,
-    `Expires: ${expiresAt.toISOString()}`,
-    ``,
-    ...codes,
-    ``
-  ].join('\n')
-  
-  fs.writeFileSync(filepath, content)
-  console.log(`📁 Saved to: ${filename}\n`)
-  
+
+  console.log(`Expires: ${expiresAt.toISOString()}`)
+  console.log(codes.join('\n'))
   return codes
 }
 
-// Run
-const count = parseInt(process.argv[2]) || 30
-const days = parseInt(process.argv[3]) || 30
-generateCodes(count, days)
+const count = Number(process.argv[2] || 30)
+const days = Number(process.argv[3] || 30)
+generateCodes(count, days).catch((error) => {
+  console.error(`Code generation failed: ${error.message}`)
+  process.exitCode = 1
+})

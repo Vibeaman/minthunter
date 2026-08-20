@@ -5,13 +5,14 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0",
-    "ethers": "^6.16.0",
-    "sql.js": "^1.11.0",
+    "axios": "^1.7.2",
     "dotenv": "^16.4.5",
-    "axios": "^1.7.2"
+    "ethers": "^6.16.0",
+    "node-telegram-bot-api": "^2.0.0",
+    "sql.js": "^1.11.0"
   }
 }

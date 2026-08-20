@@ -1,268 +1,163 @@
 /**
- * Ethereum RPC Provider Helper
- * Handles multi-RPC fallback and connection management
+ * Ethereum mainnet provider and broadcast helpers.
+ * Only explicitly configured RPC endpoints are used.
  */
 
-require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') })
+const path = require('path')
 const { ethers } = require('ethers')
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') })
 
-// RPC endpoints - premium first, then public fallbacks (more = faster FCFS)
-const RPC_ENDPOINTS = [
+const configuredRpcs = [
   process.env.ALCHEMY_RPC,
   process.env.INFURA_RPC,
   process.env.QUICKNODE_RPC,
-  'https://eth.meowrpc.com',
-  'https://rpc.ankr.com/eth',
-  'https://ethereum.publicnode.com',
-  'https://eth.drpc.org',
-  'https://1rpc.io/eth',
-  'https://eth.llamarpc.com',
-  'https://rpc.payload.de',
-  'https://eth.blockrazor.xyz',
-  'https://rpc.flashbots.net',
-  'https://rpc.builder0x69.io',
-  'https://rpc.titanbuilder.xyz'
+  ...(process.env.BROADCAST_RPCS || '').split(',').map((url) => url.trim()).filter(Boolean),
 ].filter(Boolean)
 
-// Block timing tracker
-let lastBlockTime = 0
-let avgBlockInterval = 12000 // 12 seconds default
-let blockTimeSamples = []
-
-// Cache working provider to avoid repeated tests
+const RPC_ENDPOINTS = [...new Set(configuredRpcs)]
+const CACHE_TTL = 60_000
+const RPC_TIMEOUT = 8_000
 let cachedProvider = null
 let cacheTime = 0
-const CACHE_TTL = 60000 // 1 minute
+let lastBlockTime = 0
+let avgBlockInterval = 12_000
+const blockTimeSamples = []
 
-/**
- * Get a working Ethereum provider
- * Tests endpoints in order, returns first working one
- * Caches result to avoid repeated tests
- */
-async function getProvider() {
-  // Return cached if still valid
-  if (cachedProvider && (Date.now() - cacheTime) < CACHE_TTL) {
-    return cachedProvider
+function getConfiguredEndpoints() {
+  if (RPC_ENDPOINTS.length === 0) {
+    throw new Error('Configure ALCHEMY_RPC, INFURA_RPC, QUICKNODE_RPC, or BROADCAST_RPCS')
   }
+  return RPC_ENDPOINTS
+}
 
-  for (const url of RPC_ENDPOINTS) {
+function createProvider(url) {
+  return new ethers.JsonRpcProvider(url, 1, { staticNetwork: true })
+}
+
+async function withTimeout(promise, timeout = RPC_TIMEOUT) {
+  let timer
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('RPC request timed out')), timeout)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function assertMainnet(provider) {
+  const network = await withTimeout(provider.getNetwork())
+  if (network.chainId !== 1n) throw new Error('Configured RPC is not Ethereum mainnet')
+  return provider
+}
+
+async function getProvider() {
+  if (cachedProvider && Date.now() - cacheTime < CACHE_TTL) return cachedProvider
+
+  for (const url of getConfiguredEndpoints()) {
     try {
-      console.log(`🔍 Testing RPC: ${url.substring(0, 40)}...`)
-      
-      const provider = new ethers.JsonRpcProvider(url, 1, {
-        staticNetwork: true
-      })
-      
-      // Test with timeout
-      const blockPromise = provider.getBlockNumber()
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('timeout')), 5000)
-      )
-      
-      const block = await Promise.race([blockPromise, timeoutPromise])
-      console.log(`✅ Using RPC: ${url.substring(0, 35)}... (block ${block})`)
-      
-      // Cache it
+      const provider = createProvider(url)
+      const block = await withTimeout(provider.getBlockNumber())
+      await assertMainnet(provider)
+      console.log(`✅ Using configured Ethereum RPC (block ${block})`)
       cachedProvider = provider
       cacheTime = Date.now()
-      
       return provider
-    } catch (e) {
-      console.log(`⚠️ RPC failed: ${url.substring(0, 30)}... - ${e.message?.substring(0, 30)}`)
-      continue
+    } catch (error) {
+      console.error(`⚠️ Configured RPC failed: ${error.message}`)
     }
   }
-  
-  throw new Error('All RPC endpoints failed - check ALCHEMY_RPC in .env')
+
+  throw new Error('All configured Ethereum RPC endpoints failed')
 }
 
-/**
- * Create multiple providers for parallel broadcasting
- * Used for FCFS minting to maximize speed
- */
 function createAllProviders() {
-  return RPC_ENDPOINTS.map(url => {
-    try {
-      return new ethers.JsonRpcProvider(url, 1, { staticNetwork: true })
-    } catch {
-      return null
-    }
-  }).filter(Boolean)
+  return getConfiguredEndpoints().map((url) => createProvider(url))
 }
 
-/**
- * Broadcast transaction to all providers simultaneously
- * Returns first successful response
- */
 async function broadcastToAll(signedTx) {
   const providers = createAllProviders()
-  
-  console.log(`📡 Broadcasting to ${providers.length} endpoints...`)
-  
   const results = await Promise.allSettled(
-    providers.map(p => p.broadcastTransaction(signedTx))
+    providers.map((provider) => withTimeout(provider.broadcastTransaction(signedTx), RPC_TIMEOUT)),
   )
-  
-  // Find first success
-  for (const result of results) {
-    if (result.status === 'fulfilled') {
-      console.log(`✅ TX broadcast success: ${result.value.hash}`)
-      return result.value
-    }
-  }
-  
-  // All failed
-  const errors = results.map(r => r.reason?.message || 'unknown').join(', ')
-  throw new Error(`All broadcasts failed: ${errors}`)
+  const successful = results.find((result) => result.status === 'fulfilled')
+  if (successful) return successful.value
+  const errors = results.map((result) => result.reason?.message || 'unknown RPC error').join('; ')
+  throw new Error(`All configured broadcasts failed: ${errors}`)
 }
 
-/**
- * Send transaction via Flashbots Protect RPC
- * Goes direct to block builders, skips public mempool
- * MEV protected - no front-running
- */
 async function sendViaFlashbots(signedTx) {
-  const flashbotsRpc = 'https://rpc.flashbots.net'
-  
-  console.log('⚡ Sending via Flashbots Protect...')
-  
+  if (!process.env.FLASHBOTS_RPC) return broadcastToAll(signedTx)
   try {
-    const provider = new ethers.JsonRpcProvider(flashbotsRpc, 1, { staticNetwork: true })
-    const tx = await provider.broadcastTransaction(signedTx)
-    console.log(`⚡ Flashbots TX submitted: ${tx.hash}`)
-    return tx
-  } catch (e) {
-    console.log(`⚠️ Flashbots failed: ${e.message}, falling back to regular broadcast`)
+    const provider = await assertMainnet(createProvider(process.env.FLASHBOTS_RPC))
+    return await withTimeout(provider.broadcastTransaction(signedTx))
+  } catch (error) {
+    console.error(`⚠️ Configured Flashbots RPC failed: ${error.message}`)
     return broadcastToAll(signedTx)
   }
 }
 
-/**
- * Update block timing stats
- * Call this periodically to track block intervals
- */
 async function updateBlockTiming(provider) {
   try {
-    const block = await provider.getBlock('latest')
-    const now = Date.now()
-    
-    if (lastBlockTime > 0 && block.timestamp * 1000 > lastBlockTime) {
-      const interval = block.timestamp * 1000 - lastBlockTime
-      blockTimeSamples.push(interval)
-      
-      // Keep last 10 samples
+    const block = await withTimeout(provider.getBlock('latest'))
+    const now = Number(block.timestamp) * 1000
+    if (lastBlockTime > 0 && now > lastBlockTime) {
+      blockTimeSamples.push(now - lastBlockTime)
       if (blockTimeSamples.length > 10) blockTimeSamples.shift()
-      
-      // Calculate average
-      avgBlockInterval = blockTimeSamples.reduce((a, b) => a + b, 0) / blockTimeSamples.length
-      console.log(`⏱️ Block interval: ${(avgBlockInterval / 1000).toFixed(1)}s avg`)
+      avgBlockInterval = blockTimeSamples.reduce((sum, value) => sum + value, 0) / blockTimeSamples.length
     }
-    
-    lastBlockTime = block.timestamp * 1000
+    lastBlockTime = now
     return block
-  } catch (e) {
-    console.log('⚠️ Block timing update failed:', e.message)
+  } catch (error) {
+    console.error(`⚠️ Block timing update failed: ${error.message}`)
     return null
   }
 }
 
-/**
- * Wait for optimal block timing
- * Submits tx right before next expected block for fastest inclusion
- */
 async function waitForOptimalTiming(provider) {
   const block = await updateBlockTiming(provider)
   if (!block) return
-  
-  const now = Date.now()
-  const blockAge = now - (block.timestamp * 1000)
+  const blockAge = Date.now() - Number(block.timestamp) * 1000
   const timeToNextBlock = avgBlockInterval - blockAge
-  
-  // If next block is 1-3 seconds away, wait. Otherwise submit now.
-  if (timeToNextBlock > 1000 && timeToNextBlock < 3000) {
-    const waitTime = timeToNextBlock - 500 // Submit 500ms before expected block
-    console.log(`⏳ Waiting ${waitTime}ms for optimal block timing...`)
-    await new Promise(r => setTimeout(r, waitTime))
-  } else if (timeToNextBlock > 3000) {
-    // Block just happened, next one is far - submit now to get in mempool early
-    console.log(`⚡ Block just mined, submitting immediately to mempool`)
-  } else {
-    // We're close to a block, submit immediately
-    console.log(`🎯 Near block boundary, submitting now`)
+  if (timeToNextBlock > 1_000 && timeToNextBlock < 3_000) {
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, timeToNextBlock - 500)))
   }
 }
 
-/**
- * FCFS Broadcast - Maximum speed
- * Uses block timing + sends to Flashbots AND all regular RPCs simultaneously
- */
-async function fcfsBroadcast(signedTx, useBlockTiming = true) {
-  console.log('🚀 FCFS BROADCAST - Maximum Speed Mode...')
-  
+async function fcfsBroadcast(signedTx, useBlockTiming = false) {
   const providers = createAllProviders()
-  
-  // Optimal timing (if enabled)
-  if (useBlockTiming && providers.length > 0) {
-    await waitForOptimalTiming(providers[0])
-  }
-  
-  // Builder RPCs for direct block inclusion
-  const builderRpcs = [
-    'https://rpc.flashbots.net',
-    'https://rpc.builder0x69.io',
-    'https://rpc.titanbuilder.xyz',
-    'https://rsync-builder.xyz',
-    'https://rpc.beaverbuild.org'
-  ]
-  
-  const builderProviders = builderRpcs.map(url => {
-    try {
-      return new ethers.JsonRpcProvider(url, 1, { staticNetwork: true })
-    } catch { return null }
-  }).filter(Boolean)
-  
-  // All providers: builders + public RPCs
-  const allProviders = [...builderProviders, ...providers]
-  
-  console.log(`📡 Broadcasting to ${allProviders.length} endpoints (${builderProviders.length} builders + ${providers.length} public)...`)
-  
+  if (useBlockTiming && providers.length > 0) await waitForOptimalTiming(providers[0])
+
+  const endpoints = process.env.FLASHBOTS_RPC
+    ? [process.env.FLASHBOTS_RPC, ...getConfiguredEndpoints()]
+    : getConfiguredEndpoints()
+  const allProviders = [...new Map(endpoints.map((url) => [url, createProvider(url)])).values()]
   const results = await Promise.allSettled(
-    allProviders.map(p => p.broadcastTransaction(signedTx))
+    allProviders.map((provider) => withTimeout(provider.broadcastTransaction(signedTx), RPC_TIMEOUT)),
   )
-  
-  // Count successes
-  const successes = results.filter(r => r.status === 'fulfilled')
-  console.log(`✅ Broadcast to ${successes.length}/${allProviders.length} nodes`)
-  
-  // Return first success
-  for (const result of results) {
-    if (result.status === 'fulfilled') {
-      console.log(`✅ TX hash: ${result.value.hash}`)
-      return result.value
-    }
-  }
-  
-  // All failed
-  const errors = results.map(r => r.reason?.message || 'unknown').join(', ')
-  throw new Error(`All broadcasts failed: ${errors}`)
+  const successful = results.find((result) => result.status === 'fulfilled')
+  if (successful) return successful.value
+  const errors = results.map((result) => result.reason?.message || 'unknown RPC error').join('; ')
+  throw new Error(`FCFS broadcast failed on all configured endpoints: ${errors}`)
 }
 
-/**
- * Clear cached provider (use after errors)
- */
 function clearCache() {
   cachedProvider = null
   cacheTime = 0
 }
 
 module.exports = {
-  getProvider,
-  createAllProviders,
+  RPC_ENDPOINTS,
+  assertMainnet,
   broadcastToAll,
-  sendViaFlashbots,
+  clearCache,
+  createAllProviders,
   fcfsBroadcast,
+  getProvider,
+  sendViaFlashbots,
   updateBlockTiming,
   waitForOptimalTiming,
-  clearCache,
-  RPC_ENDPOINTS
 }

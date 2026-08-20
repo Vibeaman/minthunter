@@ -66,8 +66,7 @@ const walletsMenu = {
 // Mint mode selection
 const mintModeMenu = {
   inline_keyboard: [
-    [{ text: '⚡ FCFS (Fastest)', callback_data: 'mode_fcfs' }],
-    [{ text: '🎯 Snipe (Auto-detect)', callback_data: 'mode_snipe' }],
+    [{ text: '⚡ FCFS (Configured RPC broadcast)', callback_data: 'mode_fcfs' }],
     [{ text: '🐢 Normal', callback_data: 'mode_normal' }],
     [{ text: '🔙 Back', callback_data: 'menu_mint' }]
   ]

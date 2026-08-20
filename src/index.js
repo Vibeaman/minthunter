@@ -13,10 +13,23 @@ const { getProvider, broadcastToAll, fcfsBroadcast } = require('./provider')
 const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./services/floor')
 const { analyzeContract, buildMintData } = require('./services/contract')
 const { ethers } = require('ethers')
+const {
+  isPrivateChat,
+  normalizeAccessCode,
+  parseCallbackId,
+  parseEthAmount,
+  parseUtcDateTime,
+  validateAddress,
+  validatePrivateKey,
+} = require('./security')
 
-// Fee config
-const FEE_WALLET = process.env.FEE_WALLET || '0x1d5dfc070385e6d749707fc94c4af09207d311f9'
-const FCFS_FEE = process.env.FCFS_FEE_ETH || '0.0002'
+// Fee config must be explicit and valid; never silently fall back to a wallet.
+const configuredFeeWallet = validateAddress(process.env.FEE_WALLET)
+const FEE_WALLET = configuredFeeWallet && configuredFeeWallet !== ethers.ZeroAddress ? configuredFeeWallet : null
+const FCFS_FEE = parseEthAmount(process.env.FCFS_FEE_ETH, { allowZero: false })?.text
+if (!FEE_WALLET || !FCFS_FEE) {
+  throw new Error('FEE_WALLET and FCFS_FEE_ETH must be configured with valid values')
+}
 
 // Common error messages decoder
 function decodeError(error) {
@@ -84,13 +97,37 @@ console.log('🎯 MintHunter starting...')
 
 // Track user state for multi-step flows
 const userState = new Map()
+const executingJobs = new Set()
+const accessAttempts = new Map()
+const ACCESS_WINDOW_MS = 15 * 60 * 1000
+const ACCESS_ATTEMPT_LIMIT = 5
+
+function getAuthorizedUser(userId) {
+  const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+  const isExpired = user?.access_expires && new Date(user.access_expires) <= new Date()
+  if (isExpired) {
+    db.prepare('UPDATE users SET is_authorized = 0 WHERE telegram_id = ?').run(userId)
+    return null
+  }
+  return user?.is_authorized ? user : null
+}
+
+function requirePrivateChat(msg) {
+  if (!isPrivateChat(msg)) {
+    throw new Error('MintHunter only accepts sensitive commands in a private chat.')
+  }
+}
 
 // Initialize database then start bot
 initDb().then(() => {
   console.log('💾 Database ready')
   
   // /start command
-  bot.onText(/\/start/, async (msg) => {
+  bot.onText(/^\/start(?:@\w+)?(?:\s.*)?$/, async (msg) => {
+    if (!isPrivateChat(msg)) {
+      await bot.sendMessage(msg.chat.id, '🔐 Please message MintHunter privately before using it.')
+      return
+    }
     const chatId = msg.chat.id
     const userId = msg.from.id
     const username = msg.from.username || msg.from.first_name
@@ -139,21 +176,24 @@ initDb().then(() => {
 
   // Handle menu navigation
   bot.on('callback_query', async (query) => {
-    const chatId = query.message.chat.id
-    const userId = query.from.id
+    const chatId = query.message?.chat?.id
+    const userId = query.from?.id
     const data = query.data
+    if (!chatId || !userId || query.message?.chat?.type !== 'private') {
+      await bot.answerCallbackQuery(query.id, { text: 'Use MintHunter in a private chat.' })
+      return
+    }
     
     console.log(`📥 Button: ${data} from ${userId}`)
     
     // Acknowledge button press
     await bot.answerCallbackQuery(query.id)
     
-    // Check if user is authorized and not expired
-    const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
-    const isExpired = user?.access_expires && new Date(user.access_expires) < new Date()
-    if (!user || !user.is_authorized || isExpired) {
+    // Re-check authorization and expiry on every callback.
+    const user = getAuthorizedUser(userId)
+    if (!user) {
       await bot.sendMessage(chatId,
-        `🔐 ${isExpired ? 'Your access has expired.' : 'Please enter your access code first.'}\n\nSend /start to begin.`,
+        '🔐 Your access is not active. Send /start to begin.',
         { parse_mode: 'Markdown' }
       )
       return
@@ -234,9 +274,21 @@ initDb().then(() => {
 
     // Delete wallet
     if (data.startsWith('wallet_delete_')) {
-      const walletId = parseInt(data.split('_')[2])
-      db.prepare('DELETE FROM wallets WHERE id = ? AND telegram_id = ?').run(walletId, userId)
-      await bot.sendMessage(chatId, '✅ Wallet deleted.', { reply_markup: walletsMenu })
+      const walletId = parseCallbackId(data, 'wallet_delete_')
+      if (!walletId) {
+        await bot.sendMessage(chatId, '❌ Invalid wallet action.', { reply_markup: walletsMenu })
+        return
+      }
+      const activeJobs = db.prepare(`
+        SELECT COUNT(*) AS count FROM mint_jobs
+        WHERE wallet_id = ? AND telegram_id = ? AND status IN ('pending', 'scheduled', 'executing')
+      `).get(walletId, userId)
+      if (activeJobs?.count > 0) {
+        await bot.sendMessage(chatId, '❌ Cancel the wallet’s pending or scheduled jobs before deleting it.', { reply_markup: mintMenu })
+        return
+      }
+      const deleted = db.prepare('DELETE FROM wallets WHERE id = ? AND telegram_id = ?').run(walletId, userId)
+      await bot.sendMessage(chatId, deleted.changes === 1 ? '✅ Wallet deleted.' : '❌ Wallet not found.', { reply_markup: walletsMenu })
       return
     }
 
@@ -246,9 +298,8 @@ initDb().then(() => {
       await bot.editMessageText(
         '⚡ *Minting*\n\n' +
         'Create mint jobs to auto-mint NFTs.\n\n' +
-        '• *FCFS* - Fastest, multi-RPC broadcast\n' +
-        '• *Snipe* - Watch mempool, auto-execute\n' +
-        '• *Normal* - Standard mint',
+        '• *FCFS* - Broadcast through configured RPCs\n' +
+        '• *Normal* - Standard verified transaction',
         {
           chat_id: chatId,
           message_id: query.message.message_id,
@@ -287,7 +338,11 @@ initDb().then(() => {
 
     // Wallet selected for mint
     if (data.startsWith('mint_wallet_')) {
-      const walletId = parseInt(data.split('_')[2])
+      const walletId = parseCallbackId(data, 'mint_wallet_')
+      if (!walletId) {
+        await bot.sendMessage(chatId, '❌ Invalid wallet selection.', { reply_markup: mintMenu })
+        return
+      }
       const wallet = db.prepare('SELECT * FROM wallets WHERE id = ? AND telegram_id = ?').get(walletId, userId)
       
       if (!wallet) {
@@ -319,12 +374,16 @@ initDb().then(() => {
         return
       }
       
-      const mode = data.replace('mode_', '') // fcfs, snipe, or normal
+      const mode = data.replace('mode_', '')
+      if (!['fcfs', 'normal'].includes(mode)) {
+        await bot.sendMessage(chatId, '❌ That mint mode is not available.', { reply_markup: mintMenu })
+        return
+      }
       state.mode = mode
       state.step = 'mint_price'
       userState.set(userId, state)
       
-      let modeText = mode === 'fcfs' ? '⚡ FCFS' : mode === 'snipe' ? '🎯 Snipe' : '🐢 Normal'
+      const modeText = mode === 'fcfs' ? '⚡ FCFS' : '🐢 Normal'
       
       // Check if we detected a price
       let pricePrompt = `⚡ *Mint Mode: ${modeText}*\n\n`
@@ -380,8 +439,8 @@ initDb().then(() => {
       
       // Get ETH price for USD conversion
       const ethPrice = await getEthPrice()
-      const mintPriceUsd = (parseFloat(state.mintPrice) * ethPrice).toFixed(2)
-      const feeUsd = (parseFloat(FCFS_FEE) * ethPrice).toFixed(2)
+      const mintPriceUsd = ethPrice ? (parseFloat(state.mintPrice) * ethPrice).toFixed(2) : 'unavailable'
+      const feeUsd = ethPrice ? (parseFloat(FCFS_FEE) * ethPrice).toFixed(2) : 'unavailable'
       
       const feeNote = state.mode !== 'normal' 
         ? `\n\n💰 Fee: ${FCFS_FEE} ETH (~$${feeUsd})`
@@ -392,25 +451,25 @@ initDb().then(() => {
       const skipSim = userSettings?.skip_simulation === 1
       
       if (skipSim) {
-        // YOLO MODE - instant execute
         await bot.sendMessage(chatId,
-          `⚡ *YOLO MODE - Instant Execute*\n\n` +
+          `⚠️ *Simulation skipped*\n\n` +
           `📋 Job #${jobId}\n` +
           `📍 Contract: \`${state.contract.slice(0, 10)}...\`\n` +
           `💎 Price: ${state.mintPrice} ETH (~$${mintPriceUsd})\n` +
           `⚡ Mode: ${state.mode.toUpperCase()}\n` +
           `⛽ Gas: ${gasLevel}${feeNote}\n\n` +
-          `_Executing immediately..._`,
-          { parse_mode: 'Markdown' }
+          `Review the details and tap Execute when you are ready.`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '🚀 EXECUTE NOW', callback_data: `mint_execute_${jobId}` }],
+                [{ text: '❌ Cancel Job', callback_data: `mint_cancel_${jobId}` }],
+                [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
+              ]
+            }
+          }
         )
-        
-        // Trigger execute
-        bot.emit('callback_query', {
-          id: Date.now().toString(),
-          from: { id: userId },
-          message: { chat: { id: chatId } },
-          data: `mint_execute_${jobId}`
-        })
       } else {
         // Normal mode - show options
         await bot.sendMessage(chatId,
@@ -439,7 +498,11 @@ initDb().then(() => {
     // Execute mint
     // ========== SIMULATE MINT ==========
     if (data.startsWith('mint_simulate_')) {
-      const jobId = parseInt(data.split('_')[2])
+      const jobId = parseCallbackId(data, 'mint_simulate_')
+      if (!jobId) {
+        await bot.sendMessage(chatId, '❌ Invalid job.', { reply_markup: mintMenu })
+        return
+      }
       const job = db.prepare('SELECT * FROM mint_jobs WHERE id = ? AND telegram_id = ?').get(jobId, userId)
       
       if (!job) {
@@ -447,7 +510,7 @@ initDb().then(() => {
         return
       }
       
-      const wallet = db.prepare('SELECT * FROM wallets WHERE id = ?').get(job.wallet_id)
+      const wallet = db.prepare('SELECT * FROM wallets WHERE id = ? AND telegram_id = ?').get(job.wallet_id, userId)
       if (!wallet) {
         await bot.sendMessage(chatId, '❌ Wallet not found.', { reply_markup: mintMenu })
         return
@@ -457,16 +520,24 @@ initDb().then(() => {
       
       try {
         const provider = await getProvider()
+        const network = await provider.getNetwork()
+        if (network.chainId !== 1n) throw new Error('MintHunter currently supports Ethereum mainnet only')
         const ethPrice = await getEthPrice()
-        
-        // Get current gas price
+        const detectedFn = job.mint_function ? JSON.parse(job.mint_function) : null
+        if (!detectedFn) throw new Error('No verified mint function is available for this job')
+        const mintData = buildMintData(detectedFn, 1, wallet.address)
+        if (!mintData || mintData === '0x') throw new Error('Mint calldata could not be built safely')
+        const userSettings = db.prepare('SELECT slippage_enabled, gas_boost FROM users WHERE telegram_id = ?').get(job.telegram_id)
+        const baseMintCost = ethers.parseEther(job.mint_price || '0')
+        const mintCost = userSettings?.slippage_enabled === 1
+          ? baseMintCost + (baseMintCost * 5n / 100n)
+          : baseMintCost
+        const callRequest = { to: job.contract_address, from: wallet.address, value: mintCost, data: mintData }
+        const estimatedGas = await provider.estimateGas(callRequest)
+        await provider.call(callRequest)
         const feeData = await provider.getFeeData()
-        const gasPrice = feeData.gasPrice || ethers.parseUnits('20', 'gwei')
-        
-        // Calculate costs
-        const mintCost = ethers.parseEther(job.mint_price || '0')
-        const gasLimit = BigInt(job.gas_limit)
-        const estimatedGas = gasLimit * gasPrice
+        const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || ethers.parseUnits('20', 'gwei')
+        const gasLimit = estimatedGas
         const fee = job.mint_mode !== 'normal' ? ethers.parseEther(FCFS_FEE) : 0n
         const totalCost = mintCost + estimatedGas + fee
         
@@ -480,11 +551,11 @@ initDb().then(() => {
         const totalEth = ethers.formatEther(totalCost)
         const balanceEth = ethers.formatEther(balance)
         
-        const mintUsd = (parseFloat(mintEth) * ethPrice).toFixed(2)
-        const gasUsd = (parseFloat(gasEth) * ethPrice).toFixed(2)
-        const feeUsd = (parseFloat(feeEth) * ethPrice).toFixed(2)
-        const totalUsd = (parseFloat(totalEth) * ethPrice).toFixed(2)
-        const balanceUsd = (parseFloat(balanceEth) * ethPrice).toFixed(2)
+        const mintUsd = ethPrice ? (parseFloat(mintEth) * ethPrice).toFixed(2) : 'unavailable'
+        const gasUsd = ethPrice ? (parseFloat(gasEth) * ethPrice).toFixed(2) : 'unavailable'
+        const feeUsd = ethPrice ? (parseFloat(feeEth) * ethPrice).toFixed(2) : 'unavailable'
+        const totalUsd = ethPrice ? (parseFloat(totalEth) * ethPrice).toFixed(2) : 'unavailable'
+        const balanceUsd = ethPrice ? (parseFloat(balanceEth) * ethPrice).toFixed(2) : 'unavailable'
         
         const hasEnough = balance >= totalCost
         const statusEmoji = hasEnough ? '✅' : '❌'
@@ -531,7 +602,11 @@ initDb().then(() => {
 
     // ========== EXECUTE MINT ==========
     if (data.startsWith('mint_execute_')) {
-      const jobId = parseInt(data.split('_')[2])
+      const jobId = parseCallbackId(data, 'mint_execute_')
+      if (!jobId) {
+        await bot.sendMessage(chatId, '❌ Invalid job.', { reply_markup: mintMenu })
+        return
+      }
       const job = db.prepare('SELECT * FROM mint_jobs WHERE id = ? AND telegram_id = ?').get(jobId, userId)
       
       if (!job) {
@@ -539,14 +614,25 @@ initDb().then(() => {
         return
       }
       
-      if (job.status !== 'pending') {
+      if (job.status !== 'pending' || executingJobs.has(jobId)) {
         await bot.sendMessage(chatId, `❌ Job already ${job.status}.`, { reply_markup: mintMenu })
         return
       }
+      const claimed = db.prepare(`
+        UPDATE mint_jobs SET status = 'executing', executed_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND telegram_id = ? AND status = 'pending'
+      `).run(jobId, userId)
+      if (claimed.changes !== 1) {
+        await bot.sendMessage(chatId, '❌ This job is already being processed.', { reply_markup: mintMenu })
+        return
+      }
+      executingJobs.add(jobId)
       
-      // Get wallet
-      const wallet = db.prepare('SELECT * FROM wallets WHERE id = ?').get(job.wallet_id)
+      // Get only the current user's wallet.
+      const wallet = db.prepare('SELECT * FROM wallets WHERE id = ? AND telegram_id = ?').get(job.wallet_id, userId)
       if (!wallet) {
+        db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', jobId)
+        executingJobs.delete(jobId)
         await bot.sendMessage(chatId, '❌ Wallet not found.', { reply_markup: mintMenu })
         return
       }
@@ -559,6 +645,8 @@ initDb().then(() => {
         
         // Get provider
         const provider = await getProvider()
+        const network = await provider.getNetwork()
+        if (network.chainId !== 1n) throw new Error('MintHunter currently supports Ethereum mainnet only')
         const signer = new ethers.Wallet(privateKey, provider)
         
         // Check balance
@@ -587,10 +675,12 @@ initDb().then(() => {
         if (balance < totalNeeded) {
           const shortfall = ethers.formatEther(totalNeeded - balance)
           const ethPrice = await getEthPrice()
-          const needUsd = (parseFloat(ethers.formatEther(totalNeeded)) * ethPrice).toFixed(2)
-          const haveUsd = (parseFloat(ethers.formatEther(balance)) * ethPrice).toFixed(2)
-          const shortUsd = (parseFloat(shortfall) * ethPrice).toFixed(2)
+          const needUsd = ethPrice ? (parseFloat(ethers.formatEther(totalNeeded)) * ethPrice).toFixed(2) : 'unavailable'
+          const haveUsd = ethPrice ? (parseFloat(ethers.formatEther(balance)) * ethPrice).toFixed(2) : 'unavailable'
+          const shortUsd = ethPrice ? (parseFloat(shortfall) * ethPrice).toFixed(2) : 'unavailable'
           
+          db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('pending', jobId)
+          executingJobs.delete(jobId)
           await bot.sendMessage(chatId,
             `❌ *Insufficient Balance*\n\n` +
             `Need: ~${ethers.formatEther(totalNeeded)} ETH (~$${needUsd})\n` +
@@ -601,124 +691,31 @@ initDb().then(() => {
           return
         }
         
-        // Pay fee first if FCFS/Snipe
-        if (job.mint_mode !== 'normal' && fee > 0n) {
-          await bot.sendMessage(chatId, `💰 Paying ${FCFS_FEE} ETH fee...`)
-          
-          const feeTx = await signer.sendTransaction({
-            to: FEE_WALLET,
-            value: fee
-          })
-          await feeTx.wait()
-          console.log(`💰 Fee paid: ${feeTx.hash}`)
-        }
-        
-        // Build mint transaction
-        await bot.sendMessage(chatId, '🔨 Building mint transaction...')
-        
-        // Try common mint functions (expanded list)
-        let tx
-        let success = false
-        
-        // Check if we have a detected mint function from contract analysis
+        // Only execute calldata produced from a verified ABI. Never send value with empty data.
+        await bot.sendMessage(chatId, '🔨 Building and simulating mint transaction...')
         const detectedFn = job.mint_function ? JSON.parse(job.mint_function) : null
-        
-        if (detectedFn) {
-          // Use the detected function directly
-          console.log(`🎯 Using detected mint function: ${detectedFn.signature}`)
-          await bot.sendMessage(chatId, `🎯 Using detected: \`${detectedFn.signature}\``, { parse_mode: 'Markdown' })
-          
-          try {
-            const mintData = buildMintData(detectedFn, 1, wallet.address)
-            if (mintData) {
-              tx = await signer.sendTransaction({
-                to: job.contract_address,
-                value: mintCost,
-                gasLimit: job.gas_limit,
-                data: mintData
-              })
-              success = true
-            }
-          } catch (e) {
-            console.log(`Detected function failed: ${e.message}, falling back...`)
-          }
+        if (!detectedFn) throw new Error('No verified mint function is available for this job')
+        const mintData = buildMintData(detectedFn, 1, wallet.address)
+        if (!mintData || mintData === '0x') throw new Error('Mint calldata could not be built safely')
+
+        const gasBoost = BigInt(Math.min(Math.max(Number(userSettings?.gas_boost || 2), 1), 20))
+        const maxFeePerGas = (feeData.maxFeePerGas || feeData.gasPrice || ethers.parseUnits('30', 'gwei')) * gasBoost
+        const maxPriorityFeePerGas = (feeData.maxPriorityFeePerGas || ethers.parseUnits('2', 'gwei')) * gasBoost
+        const nonce = await provider.getTransactionCount(wallet.address, 'pending')
+        const txRequest = {
+          to: job.contract_address,
+          from: wallet.address,
+          value: mintCost,
+          data: mintData,
+          nonce,
+          maxFeePerGas,
+          maxPriorityFeePerGas,
         }
-        
-        // Fallback to trying common functions
-        if (!success) {
-          const mintFunctions = [
-            // Standard mint
-            'mint()',
-            'mint(uint256)',
-            'mint(address)',
-            'mint(address,uint256)',
-            // Public mint
-            'publicMint()',
-            'publicMint(uint256)',
-            'publicSaleMint()',
-            'publicSaleMint(uint256)',
-            // Free mint
-            'freeMint()',
-            'freeMint(uint256)',
-            'mintFree()',
-            'mintFree(uint256)',
-            'claim()',
-            'claim(uint256)',
-            'claimFree()',
-            // NFT variations
-            'mintNFT()',
-            'mintNFT(uint256)',
-            'mintNFTs(uint256)',
-            // Other common names
-            'safeMint()',
-            'safeMint(address)',
-            'purchase()',
-            'purchase(uint256)',
-            'buy()',
-            'buy(uint256)'
-          ]
-          
-          const contract = new ethers.Contract(
-            job.contract_address,
-            mintFunctions.map(fn => `function ${fn} payable`),
-            signer
-          )
-          
-          for (const fn of mintFunctions) {
-            try {
-              const fnName = fn.split('(')[0]
-              const hasParam = fn.includes('uint256')
-              
-              if (hasParam) {
-                tx = await contract[fnName](1, { 
-                  value: mintCost,
-                  gasLimit: job.gas_limit
-                })
-              } else {
-                tx = await contract[fnName]({ 
-                  value: mintCost,
-                  gasLimit: job.gas_limit
-                })
-              }
-              success = true
-              console.log(`✅ Mint succeeded with: ${fn}`)
-              break
-            } catch (e) {
-              continue
-            }
-          }
-        }
-        
-        if (!success) {
-          // Try raw call as last resort
-          tx = await signer.sendTransaction({
-            to: job.contract_address,
-            value: mintCost,
-            gasLimit: job.gas_limit,
-            data: '0x' // empty data for fallback mint
-          })
-        }
-        
+        const estimatedGas = await provider.estimateGas(txRequest)
+        txRequest.gasLimit = estimatedGas > BigInt(job.gas_limit) ? estimatedGas : BigInt(job.gas_limit)
+        await provider.call(txRequest)
+
+        const tx = await signer.sendTransaction(txRequest)
         // Update job
         db.prepare(`
           UPDATE mint_jobs 
@@ -737,6 +734,16 @@ initDb().then(() => {
         const receipt = await tx.wait()
         
         if (receipt.status === 1) {
+          let feeTxHash = null
+          if (job.mint_mode !== 'normal' && fee > 0n) {
+            try {
+              const feeTx = await signer.sendTransaction({ to: FEE_WALLET, value: fee })
+              await feeTx.wait(1)
+              feeTxHash = feeTx.hash
+            } catch (feeError) {
+              console.error(`Fee collection failed for job #${jobId}:`, feeError.message)
+            }
+          }
           db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('completed', jobId)
           
           // Generate sell links
@@ -746,6 +753,7 @@ initDb().then(() => {
           await bot.sendMessage(chatId,
             `✅ *Mint Successful!*\n\n` +
             `TX: \`${tx.hash}\`\n` +
+            `${feeTxHash ? `Fee TX: \`${feeTxHash}\`\n` : ''}` +
             `Gas Used: ${receipt.gasUsed.toString()}\n\n` +
             `🎉 *List it for sale:*`,
             {
@@ -781,15 +789,24 @@ initDb().then(() => {
           `_Raw: ${err.message?.slice(0, 100) || 'Unknown'}_`,
           { parse_mode: 'Markdown', reply_markup: mintMenu }
         )
+      } finally {
+        executingJobs.delete(jobId)
       }
       return
     }
 
     // Cancel mint job
     if (data.startsWith('mint_cancel_')) {
-      const jobId = parseInt(data.split('_')[2])
-      db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ? AND telegram_id = ?').run('cancelled', jobId, userId)
-      await bot.sendMessage(chatId, '✅ Job cancelled.', { reply_markup: mintMenu })
+      const jobId = parseCallbackId(data, 'mint_cancel_')
+      if (!jobId) {
+        await bot.sendMessage(chatId, '❌ Invalid job.', { reply_markup: mintMenu })
+        return
+      }
+      const cancelled = db.prepare(`
+        UPDATE mint_jobs SET status = 'cancelled'
+        WHERE id = ? AND telegram_id = ? AND status IN ('pending', 'scheduled')
+      `).run(jobId, userId)
+      await bot.sendMessage(chatId, cancelled.changes === 1 ? '✅ Job cancelled.' : '❌ Only pending or scheduled jobs can be cancelled.', { reply_markup: mintMenu })
       return
     }
 
@@ -823,7 +840,11 @@ initDb().then(() => {
 
     // Scheduled mint - wallet selected
     if (data.startsWith('sched_wallet_')) {
-      const walletId = parseInt(data.split('_')[2])
+      const walletId = parseCallbackId(data, 'sched_wallet_')
+      if (!walletId) {
+        await bot.sendMessage(chatId, '❌ Invalid wallet selection.', { reply_markup: mintMenu })
+        return
+      }
       const wallet = db.prepare('SELECT * FROM wallets WHERE id = ? AND telegram_id = ?').get(walletId, userId)
       
       if (!wallet) {
@@ -1020,7 +1041,11 @@ initDb().then(() => {
 
     // Delete alert
     if (data.startsWith('alert_delete_')) {
-      const alertId = parseInt(data.split('_')[2])
+      const alertId = parseCallbackId(data, 'alert_delete_')
+      if (!alertId) {
+        await bot.sendMessage(chatId, '❌ Invalid alert.', { reply_markup: alertsMenu })
+        return
+      }
       db.prepare('UPDATE floor_alerts SET is_active = 0 WHERE id = ? AND telegram_id = ?').run(alertId, userId)
       await bot.sendMessage(chatId, '✅ Alert deleted.', { reply_markup: alertsMenu })
       return
@@ -1081,7 +1106,11 @@ initDb().then(() => {
 
     // Handle gas boost selection
     if (data.startsWith('gas_boost_')) {
-      const boost = parseInt(data.replace('gas_boost_', ''))
+      const boost = Number(data.replace('gas_boost_', ''))
+      if (![2, 5, 10, 20].includes(boost)) {
+        await bot.sendMessage(chatId, '❌ Invalid gas boost option.', { reply_markup: gasBoostMenu })
+        return
+      }
       db.prepare('UPDATE users SET gas_boost = ? WHERE telegram_id = ?').run(boost, userId)
       
       await bot.sendMessage(chatId,
@@ -1225,9 +1254,8 @@ initDb().then(() => {
       return
     }
 
-    // Placeholder for other menus (whales - next part)
     if (data.startsWith('menu_')) {
-      await bot.sendMessage(chatId, `📋 ${data} - Coming in next part!`)
+      await bot.sendMessage(chatId, '❌ That menu action is unavailable. Please return to the main menu.', { reply_markup: mainMenu })
     }
   })
   
@@ -1247,10 +1275,26 @@ initDb().then(() => {
     const state = userState.get(userId)
     
     if (!state) return // No active flow
+    if (!isPrivateChat(msg)) {
+      userState.delete(userId)
+      await bot.sendMessage(chatId, '🔐 Sensitive flows are only available in a private chat.')
+      return
+    }
+    if (state.step !== 'enter_code' && !getAuthorizedUser(userId)) {
+      userState.delete(userId)
+      await bot.sendMessage(chatId, '🔐 Your access has expired. Send /start to request new access.')
+      return
+    }
     
     // ACCESS CODE: Validate code
     if (state.step === 'enter_code') {
-      const code = msg.text?.trim().toUpperCase()
+      const now = Date.now()
+      const attempt = accessAttempts.get(userId)
+      if (attempt && now - attempt.startedAt < ACCESS_WINDOW_MS && attempt.count >= ACCESS_ATTEMPT_LIMIT) {
+        await bot.sendMessage(chatId, '⏳ Too many invalid attempts. Try again in 15 minutes.')
+        return
+      }
+      const code = normalizeAccessCode(msg.text)
       
       // Check if code exists, NOT already used, and not expired
       const accessCode = db.prepare(`
@@ -1259,6 +1303,11 @@ initDb().then(() => {
       `).get(code)
       
       if (!accessCode) {
+        const current = accessAttempts.get(userId)
+        const next = current && now - current.startedAt < ACCESS_WINDOW_MS
+          ? { startedAt: current.startedAt, count: current.count + 1 }
+          : { startedAt: now, count: 1 }
+        accessAttempts.set(userId, next)
         await bot.sendMessage(chatId,
           '❌ Invalid, already used, or expired code.\n\n' +
           'Enter a valid access code:',
@@ -1268,9 +1317,15 @@ initDb().then(() => {
       }
       
       // Mark code as used by this user (one-time use)
-      db.prepare(`
-        UPDATE access_codes SET used_by = ?, used_at = datetime('now') WHERE id = ?
+      const claimed = db.prepare(`
+        UPDATE access_codes
+        SET used_by = ?, used_at = datetime('now')
+        WHERE id = ? AND used_by IS NULL AND expires_at > datetime('now')
       `).run(userId, accessCode.id)
+      if (claimed.changes !== 1) {
+        await bot.sendMessage(chatId, '❌ That access code was just used or expired. Enter another code:')
+        return
+      }
       
       // Grant 30 days access from NOW (not code expiry)
       const accessExpires = new Date()
@@ -1279,6 +1334,7 @@ initDb().then(() => {
       db.prepare('UPDATE users SET is_authorized = 1, access_expires = ? WHERE telegram_id = ?').run(accessExpires.toISOString(), userId)
       
       userState.delete(userId)
+      accessAttempts.delete(userId)
       
       console.log(`✅ User ${userId} authorized with code ${code}`)
       
@@ -1297,10 +1353,10 @@ initDb().then(() => {
     
     // ALERT: Receiving collection address
     if (state.step === 'alert_collection') {
-      const collection = msg.text?.trim()
+      const collection = validateAddress(msg.text)
       
       // Validate address
-      if (!collection || !ethers.isAddress(collection)) {
+      if (!collection) {
         await bot.sendMessage(chatId,
           '❌ Invalid contract address.\n\n_Send /cancel to abort_',
           { parse_mode: 'Markdown' }
@@ -1314,7 +1370,7 @@ initDb().then(() => {
       
       // Get ETH price for USD example
       const ethPrice = await getEthPrice()
-      const usdExample = (0.5 * ethPrice).toFixed(0)
+      const usdExample = ethPrice ? (0.5 * ethPrice).toFixed(0) : 'unavailable'
       
       await bot.sendMessage(chatId,
         '🔔 *Set Target Price*\n\n' +
@@ -1335,17 +1391,19 @@ initDb().then(() => {
       
       // Check if USD format ($100 or 100$)
       if (priceText.startsWith('$') || priceText.endsWith('$')) {
-        const usdValue = parseFloat(priceText.replace(/\$/g, ''))
-        if (!isNaN(usdValue) && usdValue > 0) {
+        const usdText = priceText.replace(/\$/g, '').trim()
+        const usdValue = /^\d+(?:\.\d{1,2})?$/.test(usdText) ? Number(usdText) : NaN
+        if (Number.isFinite(usdValue) && usdValue > 0) {
           const ethPrice = await getEthPrice()
-          price = usdValue / ethPrice
+          if (ethPrice) price = usdValue / ethPrice
           isUsd = true
         }
       } else {
-        price = parseFloat(priceText)
+        const parsedEth = parseEthAmount(priceText, { allowZero: false })
+        price = parsedEth ? Number(parsedEth.text) : NaN
       }
       
-      if (isNaN(price) || price <= 0) {
+      if (!Number.isFinite(price) || price <= 0) {
         await bot.sendMessage(chatId,
           '❌ Invalid price. Enter a number (e.g., 0.5 or $500).\n\n_Send /cancel to abort_',
           { parse_mode: 'Markdown' }
@@ -1356,7 +1414,7 @@ initDb().then(() => {
       // Get ETH price for display
       const ethPrice = await getEthPrice()
       const ethDisplay = price.toFixed(4)
-      const usdDisplay = (price * ethPrice).toFixed(2)
+      const usdDisplay = ethPrice ? (price * ethPrice).toFixed(2) : 'unavailable'
       
       state.alertPrice = ethDisplay
       state.step = 'alert_condition'
@@ -1373,9 +1431,9 @@ initDb().then(() => {
 
     // SCHEDULED MINT: Receiving contract address
     if (state.step === 'sched_contract') {
-      const contract = msg.text?.trim()
+      const contract = validateAddress(msg.text)
       
-      if (!contract || !ethers.isAddress(contract)) {
+      if (!contract) {
         await bot.sendMessage(chatId,
           '❌ Invalid contract address.\n\n_Send /cancel to abort_',
           { parse_mode: 'Markdown' }
@@ -1399,17 +1457,17 @@ initDb().then(() => {
     // SCHEDULED MINT: Receiving price
     if (state.step === 'sched_price') {
       const priceText = msg.text?.trim()
-      const price = parseFloat(priceText)
+      const parsedPrice = parseEthAmount(priceText)
       
-      if (isNaN(price) || price < 0) {
+      if (!parsedPrice) {
         await bot.sendMessage(chatId,
-          '❌ Invalid price.\n\n_Send /cancel to abort_',
+          '❌ Invalid price. Enter a decimal ETH amount from 0 to 18 decimal places.\n\n_Send /cancel to abort_',
           { parse_mode: 'Markdown' }
         )
         return
       }
       
-      state.mintPrice = priceText
+      state.mintPrice = parsedPrice.text
       state.step = 'sched_datetime'
       userState.set(userId, state)
       
@@ -1430,21 +1488,14 @@ initDb().then(() => {
     if (state.step === 'sched_datetime') {
       const datetimeText = msg.text?.trim()
       
-      // Parse datetime
-      const match = datetimeText.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/)
-      if (!match) {
+      const scheduledDate = parseUtcDateTime(datetimeText)
+      if (!scheduledDate) {
         await bot.sendMessage(chatId,
-          '❌ Invalid format. Use: `YYYY-MM-DD HH:MM`\n\n_Send /cancel to abort_',
+          '❌ Invalid UTC date or format. Use: `YYYY-MM-DD HH:MM`\n\n_Send /cancel to abort_',
           { parse_mode: 'Markdown' }
         )
         return
       }
-      
-      const [_, year, month, day, hour, minute] = match
-      const scheduledDate = new Date(Date.UTC(
-        parseInt(year), parseInt(month) - 1, parseInt(day),
-        parseInt(hour), parseInt(minute), 0
-      ))
       
       // Check if in the past
       if (scheduledDate <= new Date()) {
@@ -1455,17 +1506,31 @@ initDb().then(() => {
         return
       }
       
-      // Create scheduled job with FCFS mode and aggressive gas
+      let analysis
+      try {
+        const provider = await getProvider()
+        analysis = await analyzeContract(state.contract, provider)
+      } catch (error) {
+        await bot.sendMessage(chatId, '❌ Could not verify the contract for safe scheduling. No job was created.', { reply_markup: mintMenu })
+        return
+      }
+      if (!analysis.verified || !analysis.recommendedMint) {
+        await bot.sendMessage(chatId, '❌ This contract has no verified, supported mint function. No job was created.', { reply_markup: mintMenu })
+        return
+      }
+
+      // Create a scheduled FCFS job with the verified ABI function attached.
       const result = db.prepare(`
-        INSERT INTO mint_jobs 
-        (telegram_id, wallet_id, contract_address, mint_price, mint_mode, gas_limit, status, scheduled_at)
-        VALUES (?, ?, ?, ?, 'fcfs', ?, 'scheduled', ?)
+        INSERT INTO mint_jobs
+        (telegram_id, wallet_id, contract_address, mint_function, mint_price, mint_mode, gas_limit, status, scheduled_at)
+        VALUES (?, ?, ?, ?, ?, 'fcfs', ?, 'scheduled', ?)
       `).run(
         userId,
         state.walletId,
         state.contract,
+        JSON.stringify(analysis.recommendedMint),
         state.mintPrice,
-        375000, // Aggressive gas (250000 * 1.5)
+        375000,
         scheduledDate.toISOString()
       )
       
@@ -1476,8 +1541,8 @@ initDb().then(() => {
       
       // Get ETH price for USD
       const ethPrice = await getEthPrice()
-      const priceUsd = (parseFloat(state.mintPrice) * ethPrice).toFixed(2)
-      const feeUsd = (parseFloat(FCFS_FEE) * ethPrice).toFixed(2)
+      const priceUsd = ethPrice ? (parseFloat(state.mintPrice) * ethPrice).toFixed(2) : 'unavailable'
+      const feeUsd = ethPrice ? (parseFloat(FCFS_FEE) * ethPrice).toFixed(2) : 'unavailable'
       
       // Format display time
       const displayTime = scheduledDate.toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
@@ -1514,10 +1579,10 @@ initDb().then(() => {
 
     // MINT: Receiving contract address
     if (state.step === 'mint_contract') {
-      const contract = msg.text?.trim()
+      const contract = validateAddress(msg.text)
       
       // Validate address
-      if (!contract || !ethers.isAddress(contract)) {
+      if (!contract) {
         await bot.sendMessage(chatId,
           '❌ Invalid contract address.\n\n_Send /cancel to abort_',
           { parse_mode: 'Markdown' }
@@ -1555,14 +1620,21 @@ initDb().then(() => {
             analysisMsg += `\n📋 Found ${analysis.mintFunctions.length} mint functions`
           }
         } else {
-          analysisMsg = '⚠️ *Contract Not Verified*\n\nWill try common mint functions.'
+          analysisMsg = '❌ *Contract Not Verified*\n\nSafe auto-mint is unavailable for this contract.'
         }
         
         await bot.sendMessage(chatId, analysisMsg, { parse_mode: 'Markdown' })
+        if (!analysis.verified || !analysis.recommendedMint) {
+          userState.delete(userId)
+          await bot.sendMessage(chatId, '❌ Minting was stopped because a verified supported function was not found.', { reply_markup: mintMenu })
+          return
+        }
         
       } catch (e) {
         console.error('Contract analysis error:', e.message)
-        await bot.sendMessage(chatId, '⚠️ Could not analyze contract. Will try common mint functions.')
+        await bot.sendMessage(chatId, '❌ Could not analyze the contract safely. Mint setup has been stopped.', { reply_markup: mintMenu })
+        userState.delete(userId)
+        return
       }
       
       state.step = 'mint_mode'
@@ -1570,9 +1642,8 @@ initDb().then(() => {
       
       await bot.sendMessage(chatId,
         '⚡ *Select Mint Mode*\n\n' +
-        '• *FCFS* - Multi-RPC broadcast, fastest\n' +
-        '• *Snipe* - Watch mempool, auto-execute\n' +
-        '• *Normal* - Standard transaction',
+        '• *FCFS* - Broadcast through configured RPCs\n' +
+        '• *Normal* - Standard verified transaction',
         { parse_mode: 'Markdown', reply_markup: mintModeMenu }
       )
       return
@@ -1581,17 +1652,17 @@ initDb().then(() => {
     // MINT: Receiving mint price
     if (state.step === 'mint_price') {
       const priceText = msg.text?.trim()
-      const price = parseFloat(priceText)
+      const parsedPrice = parseEthAmount(priceText)
       
-      if (isNaN(price) || price < 0) {
+      if (!parsedPrice) {
         await bot.sendMessage(chatId,
-          '❌ Invalid price. Enter a number (e.g., 0.05 or 0).\n\n_Send /cancel to abort_',
+          '❌ Invalid price. Enter a decimal ETH amount from 0 to 18 decimal places.\n\n_Send /cancel to abort_',
           { parse_mode: 'Markdown' }
         )
         return
       }
       
-      state.mintPrice = priceText
+      state.mintPrice = parsedPrice.text
       state.step = 'mint_gas'
       userState.set(userId, state)
       
@@ -1607,27 +1678,33 @@ initDb().then(() => {
 
     // WALLET: Receiving private key
     if (state.step === 'wallet_key') {
-      const key = msg.text?.trim()
-      
-      // Validate private key
-      if (!key || !key.startsWith('0x') || key.length !== 66) {
+      const wallet = validatePrivateKey(msg.text)
+      if (!wallet) {
         await bot.sendMessage(chatId,
-          '❌ Invalid private key format.\n\nMust be 64 hex chars starting with 0x.\n\n_Send /cancel to abort_',
+          '❌ Invalid private key format.\n\nMust be a valid 64-hex-character key starting with 0x.\n\n_Send /cancel to abort_',
           { parse_mode: 'Markdown' }
         )
         return
       }
+      const key = wallet.privateKey
+      const address = wallet.address
       
       try {
-        // Derive address from key
-        const wallet = new ethers.Wallet(key)
-        const address = wallet.address
+        // Encrypt and store the validated key
         
         // Encrypt and store
         const encrypted = encryptPrivateKey(key, userId.toString())
-        db.prepare(
-          'INSERT INTO wallets (telegram_id, address, encrypted_key, label) VALUES (?, ?, ?, ?)'
-        ).run(userId, address, encrypted, 'Wallet')
+        try {
+          db.prepare(
+            'INSERT INTO wallets (telegram_id, address, encrypted_key, label) VALUES (?, ?, ?, ?)'
+          ).run(userId, address, encrypted, 'Wallet')
+        } catch (insertError) {
+          if (String(insertError.message).toLowerCase().includes('unique')) {
+            await bot.sendMessage(chatId, '❌ That wallet is already added.', { reply_markup: walletsMenu })
+            return
+          }
+          throw insertError
+        }
         
         // Delete the message with the key for security
         try {
@@ -1687,7 +1764,7 @@ initDb().then(() => {
     
     try {
       // Get wallet
-      const wallet = db.prepare('SELECT * FROM wallets WHERE id = ?').get(job.wallet_id)
+      const wallet = db.prepare('SELECT * FROM wallets WHERE id = ? AND telegram_id = ?').get(job.wallet_id, job.telegram_id)
       if (!wallet) {
         await bot.sendMessage(chatId, `❌ Scheduled mint #${job.id} failed: Wallet not found`)
         db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', job.id)
@@ -1701,6 +1778,8 @@ initDb().then(() => {
       
       // Get provider
       const provider = await getProvider()
+      const network = await provider.getNetwork()
+      if (network.chainId !== 1n) throw new Error('MintHunter currently supports Ethereum mainnet only')
       const signer = new ethers.Wallet(privateKey, provider)
       
       // Check balance
@@ -1738,9 +1817,9 @@ initDb().then(() => {
       
       if (balance < totalNeeded) {
         const shortfall = ethers.formatEther(totalNeeded - balance)
-        const shortUsd = (parseFloat(shortfall) * ethPrice).toFixed(2)
-        const balanceUsd = (parseFloat(ethers.formatEther(balance)) * ethPrice).toFixed(2)
-        const neededUsd = (parseFloat(ethers.formatEther(totalNeeded)) * ethPrice).toFixed(2)
+        const shortUsd = ethPrice ? (parseFloat(shortfall) * ethPrice).toFixed(2) : 'unavailable'
+        const balanceUsd = ethPrice ? (parseFloat(ethers.formatEther(balance)) * ethPrice).toFixed(2) : 'unavailable'
+        const neededUsd = ethPrice ? (parseFloat(ethers.formatEther(totalNeeded)) * ethPrice).toFixed(2) : 'unavailable'
         await bot.sendMessage(chatId,
           `❌ *Scheduled Mint #${job.id} Failed*\n\n` +
           `Insufficient balance!\n\n` +
@@ -1753,19 +1832,11 @@ initDb().then(() => {
         return
       }
       
-      // Pay fee
-      await bot.sendMessage(chatId, `💰 Paying fee...`)
-      const feeTx = await signer.sendTransaction({
-        to: FEE_WALLET,
-        value: fee
-      })
-      await feeTx.wait(1) // Wait 1 confirmation only for speed
-      
-      // Execute mint with max speed
+      // Execute mint with max speed. The fee is collected only after confirmation.
       await bot.sendMessage(chatId, `⚡ Broadcasting mint to all RPCs...`)
       
       // Build transaction
-      const nonce = await provider.getTransactionCount(wallet.address)
+      const nonce = await provider.getTransactionCount(wallet.address, 'pending')
       const feeData = await provider.getFeeData()
       
       // Get gas boost from user settings (already fetched above)
@@ -1777,22 +1848,26 @@ initDb().then(() => {
       
       console.log(`⛽ Gas boost: ${gasBoost}x | maxFee: ${ethers.formatUnits(maxFeePerGas, 'gwei')} gwei`)
       
-      // Check for detected mint function
+      // Scheduled jobs must carry verified ABI data created at scheduling time.
       const detectedFn = job.mint_function ? JSON.parse(job.mint_function) : null
-      
+      if (!detectedFn) throw new Error('Scheduled job has no verified mint function')
+      const mintData = buildMintData(detectedFn, 1, wallet.address)
+      if (!mintData || mintData === '0x') throw new Error('Scheduled mint calldata could not be built safely')
+      const estimatedMintGas = await provider.estimateGas({
+        to: job.contract_address,
+        from: wallet.address,
+        value: mintCost,
+        data: mintData,
+      })
+      await provider.call({ to: job.contract_address, from: wallet.address, value: mintCost, data: mintData })
+      const gasLimit = estimatedMintGas > BigInt(job.gas_limit) ? estimatedMintGas : BigInt(job.gas_limit)
       let tx
-      let mintData = '0x1249c58b' // default: mint()
-      
-      if (detectedFn) {
-        console.log(`🎯 Scheduled mint using detected: ${detectedFn.signature}`)
-        mintData = buildMintData(detectedFn, 1, wallet.address) || mintData
-      }
       
       try {
         const txData = {
           to: job.contract_address,
           value: mintCost,
-          gasLimit: job.gas_limit,
+          gasLimit,
           maxFeePerGas,
           maxPriorityFeePerGas,
           nonce,
@@ -1809,7 +1884,9 @@ initDb().then(() => {
         tx = await signer.sendTransaction({
           to: job.contract_address,
           value: mintCost,
-          gasLimit: job.gas_limit,
+          data: mintData,
+          nonce,
+          gasLimit,
           maxFeePerGas,
           maxPriorityFeePerGas
         })
@@ -1831,6 +1908,16 @@ initDb().then(() => {
       const receipt = await tx.wait()
       
       if (receipt.status === 1) {
+        let feeTxHash = null
+        if (fee > 0n) {
+          try {
+            const feeTx = await signer.sendTransaction({ to: FEE_WALLET, value: fee })
+            await feeTx.wait(1)
+            feeTxHash = feeTx.hash
+          } catch (feeError) {
+            console.error(`Scheduled fee collection failed for job #${job.id}:`, feeError.message)
+          }
+        }
         db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('completed', job.id)
         
         // Generate sell links
@@ -1842,6 +1929,7 @@ initDb().then(() => {
           `✅ *SCHEDULED MINT SUCCESS!*\n\n` +
           `Job #${job.id}\n` +
           `TX: \`${tx.hash}\`\n` +
+          `${feeTxHash ? `Fee TX: \`${feeTxHash}\`\n` : ''}` +
           `Gas: ${receipt.gasUsed.toString()}\n\n` +
           `🎉 *List it for sale:*`,
           {
@@ -1888,8 +1976,12 @@ initDb().then(() => {
       `).all(now.toISOString())
       
       for (const job of jobs) {
-        // Mark as executing immediately to prevent double-execution
-        db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('executing', job.id)
+        // Atomically claim the job before starting asynchronous execution.
+        const claimed = db.prepare(`
+          UPDATE mint_jobs SET status = 'executing'
+          WHERE id = ? AND status = 'scheduled'
+        `).run(job.id)
+        if (claimed.changes !== 1) continue
         
         // Execute async (don't block the loop)
         executeScheduledMint(job).catch(e => {
@@ -1914,9 +2006,21 @@ initDb().then(() => {
   process.exit(1)
 })
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('👋 Shutting down...')
-  bot.stopPolling()
-  process.exit(0)
+// Centralized process and Telegram error handling.
+bot.on('polling_error', (error) => console.error('Telegram polling error:', error.message))
+bot.on('error', (error) => console.error('Telegram bot error:', error.message))
+process.on('unhandledRejection', (error) => console.error('Unhandled rejection:', error))
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error)
+  process.exitCode = 1
 })
+
+// Graceful shutdown
+async function shutdown(signal) {
+  console.log(`👋 Shutting down after ${signal}...`)
+  bot.stopPolling()
+  try { db.save() } catch (error) { console.error('Database flush failed:', error.message) }
+  process.exit(0)
+}
+process.once('SIGINT', () => shutdown('SIGINT'))
+process.once('SIGTERM', () => shutdown('SIGTERM'))

@@ -4,7 +4,9 @@
  */
 
 const axios = require('axios')
+const path = require('path')
 const { ethers } = require('ethers')
+require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') })
 
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || ''
 
@@ -59,7 +61,7 @@ function findMintFunctions(abi) {
   
   for (const item of abi) {
     if (item.type !== 'function') continue
-    if (!item.name) continue
+    if (!item.name || ['view', 'pure'].includes(item.stateMutability)) continue
     
     const nameLower = item.name.toLowerCase()
     
@@ -69,10 +71,12 @@ function findMintFunctions(abi) {
     // Also check if it's payable (can receive ETH)
     const isPayable = item.stateMutability === 'payable'
     
-    // Check inputs - mint functions typically have 0-2 params
-    const hasReasonableParams = item.inputs.length <= 3
+    // Only retain argument types that the safe calldata builder can represent.
+    const hasSupportedParams = item.inputs.length <= 3 && item.inputs.every((input) => (
+      /^uint(8|16|32|64|128|256)?$/.test(input.type.toLowerCase()) || input.type.toLowerCase() === 'address'
+    ))
     
-    if (isMintLike && hasReasonableParams) {
+    if (isMintLike && hasSupportedParams) {
       // Build function signature
       const inputTypes = item.inputs.map(i => i.type).join(',')
       const signature = `${item.name}(${inputTypes})`
@@ -220,7 +224,7 @@ async function analyzeContract(contractAddress, provider) {
     
     if (!abi) {
       result.error = 'Contract not verified on Etherscan'
-      console.log('⚠️ Contract not verified, will use fallback mint functions')
+      console.log('⚠️ Contract not verified; safe auto-mint is unavailable')
       return result
     }
     
@@ -238,6 +242,8 @@ async function analyzeContract(contractAddress, provider) {
     if (result.mintFunctions.length > 0) {
       result.recommendedMint = result.mintFunctions[0]
       console.log(`Recommended mint: ${result.recommendedMint.signature}`)
+    } else {
+      result.error = 'No supported external mint function found in the verified ABI'
     }
     
     // Try to get price
@@ -258,37 +264,39 @@ async function analyzeContract(contractAddress, provider) {
  * Build mint transaction data
  */
 function buildMintData(mintFunction, quantity = 1, walletAddress = null) {
-  if (!mintFunction) return null
-  
+  if (!mintFunction || !Array.isArray(mintFunction.inputs)) return null
+  if (!walletAddress || !ethers.isAddress(walletAddress)) return null
+
   try {
     const iface = new ethers.Interface([`function ${mintFunction.signature}`])
-    
-    // Build args based on input types
-    const args = mintFunction.inputs.map(input => {
-      const typeLower = input.type.toLowerCase()
-      const nameLower = (input.name || '').toLowerCase()
-      
-      if (typeLower === 'uint256') {
-        // Likely quantity
+    const inputs = mintFunction.inputs
+    const integerInputs = inputs.filter((input) => /^uint(8|16|32|64|128|256)?$/.test(input.type.toLowerCase()))
+    const addressInputs = inputs.filter((input) => input.type.toLowerCase() === 'address')
+
+    const args = inputs.map((input) => {
+      const type = input.type.toLowerCase()
+      const name = (input.name || '').toLowerCase()
+
+      if (/^uint(8|16|32|64|128|256)?$/.test(type)) {
+        const quantityName = /(^|_)(quantity|amount|count|number|num|qty)($|_)/.test(name)
+        if (integerInputs.length > 1 && !quantityName) {
+          throw new Error(`Unsupported ambiguous integer argument: ${input.name || type}`)
+        }
         return quantity
-      } else if (typeLower === 'address') {
-        // Likely recipient
-        return walletAddress
-      } else if (typeLower.startsWith('bytes32')) {
-        // Likely merkle proof - return empty for public mint
-        return ethers.ZeroHash
-      } else if (typeLower === 'bytes32[]') {
-        // Merkle proof array
-        return []
       }
-      
-      // Default
-      return quantity
+
+      if (type === 'address') {
+        const recipientName = /(^|_)(to|recipient|receiver|wallet|account|owner)($|_)/.test(name)
+        if (addressInputs.length > 1 && !recipientName) {
+          throw new Error(`Unsupported ambiguous address argument: ${input.name || type}`)
+        }
+        return walletAddress
+      }
+
+      throw new Error(`Unsupported mint argument type: ${input.type}`)
     })
-    
-    const data = iface.encodeFunctionData(mintFunction.name, args)
-    return data
-    
+
+    return iface.encodeFunctionData(mintFunction.name, args)
   } catch (error) {
     console.error('Error building mint data:', error.message)
     return null

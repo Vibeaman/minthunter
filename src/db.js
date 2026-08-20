@@ -145,10 +145,18 @@ async function initDb() {
     // Column already exists
   }
 
-  // Reset all existing users to unauthorized
-  db.run('UPDATE users SET is_authorized = 0')
+  // Keep existing authorization state across restarts. Expiry is checked at use time.
+  try {
+    db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_wallets_user_address ON wallets(telegram_id, address)')
+  } catch (error) {
+    console.error(`Wallet uniqueness migration skipped: ${error.message}`)
+  }
+  db.run('CREATE INDEX IF NOT EXISTS idx_alerts_active_collection ON floor_alerts(is_active, collection_address)')
+  db.run('CREATE INDEX IF NOT EXISTS idx_mint_jobs_status_schedule ON mint_jobs(status, scheduled_at)')
+  db.run('CREATE INDEX IF NOT EXISTS idx_mint_jobs_user_status ON mint_jobs(telegram_id, status)')
 
   save()
+
   initialized = true
   console.log('✅ Database initialized')
   return db
@@ -159,7 +167,9 @@ function save() {
   if (db) {
     const data = db.export()
     const buffer = Buffer.from(data)
-    fs.writeFileSync(DB_PATH, buffer)
+    const tempPath = `${DB_PATH}.tmp`
+    fs.writeFileSync(tempPath, buffer)
+    fs.renameSync(tempPath, DB_PATH)
   }
 }
 
@@ -177,16 +187,8 @@ const dbWrapper = {
       
       let lastId = 0
       if (isInsert) {
-        // Extract table name and query max id
-        const match = sql.match(/INSERT\s+INTO\s+(\w+)/i)
-        if (match) {
-          const table = match[1]
-          const stmt = db.prepare(`SELECT MAX(id) FROM ${table}`)
-          if (stmt.step()) {
-            lastId = stmt.get()[0] || 0
-          }
-          stmt.free()
-        }
+        const result = db.exec('SELECT last_insert_rowid() AS id')
+        lastId = result[0]?.values?.[0]?.[0] || 0
       }
       
       return { lastInsertRowid: lastId, changes: db.getRowsModified() }
