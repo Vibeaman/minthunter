@@ -32,7 +32,8 @@ function getConfiguredEndpoints() {
 }
 
 function createProvider(url) {
-  return new ethers.JsonRpcProvider(url, 1, { staticNetwork: true })
+  // Do not use staticNetwork here: the endpoint itself must prove it serves mainnet.
+  return new ethers.JsonRpcProvider(url)
 }
 
 function getOrCreateProvider(url) {

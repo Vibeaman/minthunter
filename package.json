@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "benchmark:fcfs": "node scripts/benchmark-fcfs.js"
   },
   "dependencies": {
     "axios": "^1.7.2",
