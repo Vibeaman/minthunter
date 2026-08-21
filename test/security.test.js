@@ -13,6 +13,7 @@ const {
   validatePrivateKey,
 } = require('../src/security')
 const { buildMintData } = require('../src/services/contract')
+const { firstSuccessfulBroadcast } = require('../src/provider')
 
 const privateKey = `0x${'22'.repeat(32)}`
 const walletAddress = validatePrivateKey(privateKey).address
@@ -60,4 +61,26 @@ test('calldata builder rejects unsupported proof arguments', () => {
     ],
   }, 1, walletAddress)
   assert.equal(data, null)
+})
+
+test('FCFS broadcast returns on the first accepted RPC', async () => {
+  let slowSettled = false
+  const slowProvider = {
+    broadcastTransaction: async () => new Promise((resolve) => {
+      setTimeout(() => {
+        slowSettled = true
+        resolve({ hash: '0xslow' })
+      }, 80)
+    }),
+  }
+  const fastProvider = {
+    broadcastTransaction: async () => ({ hash: '0xfast' }),
+  }
+
+  const result = await firstSuccessfulBroadcast([slowProvider, fastProvider], '0xsigned', 'Test broadcast')
+  assert.equal(result.hash, '0xfast')
+  assert.equal(slowSettled, false)
+
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  assert.equal(slowSettled, true)
 })

@@ -17,6 +17,7 @@ const configuredRpcs = [
 const RPC_ENDPOINTS = [...new Set(configuredRpcs)]
 const CACHE_TTL = 60_000
 const RPC_TIMEOUT = 8_000
+const providerCache = new Map()
 let cachedProvider = null
 let cacheTime = 0
 let lastBlockTime = 0
@@ -32,6 +33,11 @@ function getConfiguredEndpoints() {
 
 function createProvider(url) {
   return new ethers.JsonRpcProvider(url, 1, { staticNetwork: true })
+}
+
+function getOrCreateProvider(url) {
+  if (!providerCache.has(url)) providerCache.set(url, createProvider(url))
+  return providerCache.get(url)
 }
 
 async function withTimeout(promise, timeout = RPC_TIMEOUT) {
@@ -57,42 +63,52 @@ async function assertMainnet(provider) {
 async function getProvider() {
   if (cachedProvider && Date.now() - cacheTime < CACHE_TTL) return cachedProvider
 
-  for (const url of getConfiguredEndpoints()) {
-    try {
-      const provider = createProvider(url)
-      const block = await withTimeout(provider.getBlockNumber())
-      await assertMainnet(provider)
-      console.log(`✅ Using configured Ethereum RPC (block ${block})`)
-      cachedProvider = provider
-      cacheTime = Date.now()
-      return provider
-    } catch (error) {
-      console.error(`⚠️ Configured RPC failed: ${error.message}`)
-    }
-  }
+  const attempts = getConfiguredEndpoints().map(async (url) => {
+    const provider = getOrCreateProvider(url)
+    const block = await withTimeout(provider.getBlockNumber())
+    await assertMainnet(provider)
+    return { provider, block, url }
+  })
 
-  throw new Error('All configured Ethereum RPC endpoints failed')
+  try {
+    const winner = await Promise.any(attempts)
+    console.log(`✅ Using configured Ethereum RPC (block ${winner.block})`)
+    cachedProvider = winner.provider
+    cacheTime = Date.now()
+    return winner.provider
+  } catch (error) {
+    const reasons = error.errors?.map((reason) => reason?.message || 'unknown RPC error').join('; ')
+    throw new Error(`All configured Ethereum RPC endpoints failed${reasons ? `: ${reasons}` : ''}`)
+  }
 }
 
 function createAllProviders() {
-  return getConfiguredEndpoints().map((url) => createProvider(url))
+  return getConfiguredEndpoints().map(getOrCreateProvider)
+}
+
+async function firstSuccessfulBroadcast(providers, signedTx, label) {
+  const attempts = providers.map((provider) => (
+    withTimeout(provider.broadcastTransaction(signedTx), RPC_TIMEOUT)
+  ))
+
+  try {
+    // Return as soon as any trusted endpoint accepts the transaction. Promise.any
+    // still observes every rejection, so no slow or failed RPC becomes unhandled.
+    return await Promise.any(attempts)
+  } catch (error) {
+    const reasons = error.errors?.map((reason) => reason?.message || 'unknown RPC error').join('; ')
+    throw new Error(`${label} failed on all configured endpoints${reasons ? `: ${reasons}` : ''}`)
+  }
 }
 
 async function broadcastToAll(signedTx) {
-  const providers = createAllProviders()
-  const results = await Promise.allSettled(
-    providers.map((provider) => withTimeout(provider.broadcastTransaction(signedTx), RPC_TIMEOUT)),
-  )
-  const successful = results.find((result) => result.status === 'fulfilled')
-  if (successful) return successful.value
-  const errors = results.map((result) => result.reason?.message || 'unknown RPC error').join('; ')
-  throw new Error(`All configured broadcasts failed: ${errors}`)
+  return firstSuccessfulBroadcast(createAllProviders(), signedTx, 'Broadcast')
 }
 
 async function sendViaFlashbots(signedTx) {
   if (!process.env.FLASHBOTS_RPC) return broadcastToAll(signedTx)
   try {
-    const provider = await assertMainnet(createProvider(process.env.FLASHBOTS_RPC))
+    const provider = await assertMainnet(getOrCreateProvider(process.env.FLASHBOTS_RPC))
     return await withTimeout(provider.broadcastTransaction(signedTx))
   } catch (error) {
     console.error(`⚠️ Configured Flashbots RPC failed: ${error.message}`)
@@ -128,25 +144,23 @@ async function waitForOptimalTiming(provider) {
 }
 
 async function fcfsBroadcast(signedTx, useBlockTiming = false) {
-  const providers = createAllProviders()
-  if (useBlockTiming && providers.length > 0) await waitForOptimalTiming(providers[0])
-
   const endpoints = process.env.FLASHBOTS_RPC
     ? [process.env.FLASHBOTS_RPC, ...getConfiguredEndpoints()]
     : getConfiguredEndpoints()
-  const allProviders = [...new Map(endpoints.map((url) => [url, createProvider(url)])).values()]
-  const results = await Promise.allSettled(
-    allProviders.map((provider) => withTimeout(provider.broadcastTransaction(signedTx), RPC_TIMEOUT)),
-  )
-  const successful = results.find((result) => result.status === 'fulfilled')
-  if (successful) return successful.value
-  const errors = results.map((result) => result.reason?.message || 'unknown RPC error').join('; ')
-  throw new Error(`FCFS broadcast failed on all configured endpoints: ${errors}`)
+  const uniqueEndpoints = [...new Set(endpoints)]
+  const providers = uniqueEndpoints.map(getOrCreateProvider)
+
+  // Disabled by default because waiting for a block edge is slower than immediate
+  // propagation. It remains opt-in for controlled experiments.
+  if (useBlockTiming && providers.length > 0) await waitForOptimalTiming(providers[0])
+
+  return firstSuccessfulBroadcast(providers, signedTx, 'FCFS broadcast')
 }
 
 function clearCache() {
   cachedProvider = null
   cacheTime = 0
+  providerCache.clear()
 }
 
 module.exports = {
@@ -156,6 +170,7 @@ module.exports = {
   clearCache,
   createAllProviders,
   fcfsBroadcast,
+  firstSuccessfulBroadcast,
   getProvider,
   sendViaFlashbots,
   updateBlockTiming,

@@ -98,6 +98,7 @@ console.log('🎯 MintHunter starting...')
 // Track user state for multi-step flows
 const userState = new Map()
 const executingJobs = new Set()
+const walletLocks = new Set()
 const accessAttempts = new Map()
 const ACCESS_WINDOW_MS = 15 * 60 * 1000
 const ACCESS_ATTEMPT_LIMIT = 5
@@ -636,21 +637,29 @@ initDb().then(() => {
         await bot.sendMessage(chatId, '❌ Wallet not found.', { reply_markup: mintMenu })
         return
       }
+      if (walletLocks.has(wallet.id)) {
+        db.prepare("UPDATE mint_jobs SET status = 'pending' WHERE id = ?").run(jobId)
+        executingJobs.delete(jobId)
+        await bot.sendMessage(chatId, '⏳ Another transaction is already using this wallet. Please wait.', { reply_markup: mintMenu })
+        return
+      }
+      walletLocks.add(wallet.id)
       
-      await bot.sendMessage(chatId, '⏳ Executing mint...')
+      bot.sendMessage(chatId, '⏳ Executing mint...').catch((error) => console.error('Execution status notification failed:', error.message))
       
       try {
         // Decrypt private key
         const privateKey = decryptPrivateKey(wallet.encrypted_key, userId.toString())
         
         // Get provider
+        // getProvider validates mainnet when selecting or refreshing the cached provider.
         const provider = await getProvider()
-        const network = await provider.getNetwork()
-        if (network.chainId !== 1n) throw new Error('MintHunter currently supports Ethereum mainnet only')
         const signer = new ethers.Wallet(privateKey, provider)
         
-        // Check balance
-        const balance = await provider.getBalance(wallet.address)
+        // Start independent RPC reads immediately; local cost/settings work runs in parallel.
+        const balancePromise = provider.getBalance(wallet.address)
+        const noncePromise = provider.getTransactionCount(wallet.address, 'pending')
+        const feeDataPromise = provider.getFeeData()
         const baseMintCost = ethers.parseEther(job.mint_price || '0')
         
         // Check user's slippage and gas boost settings
@@ -664,8 +673,13 @@ initDb().then(() => {
         
         const fee = job.mint_mode !== 'normal' ? ethers.parseEther(FCFS_FEE) : 0n
         
+        const [balance, nonce, feeData] = await Promise.all([
+          balancePromise,
+          noncePromise,
+          feeDataPromise,
+        ])
+
         // Get actual gas price from network
-        const feeData = await provider.getFeeData()
         const currentGasPrice = feeData.gasPrice || ethers.parseUnits('30', 'gwei')
         const gasBoostMultiplier = BigInt(userSettings?.gas_boost || 2)
         const boostedGasPrice = currentGasPrice * gasBoostMultiplier
@@ -692,7 +706,7 @@ initDb().then(() => {
         }
         
         // Only execute calldata produced from a verified ABI. Never send value with empty data.
-        await bot.sendMessage(chatId, '🔨 Building and simulating mint transaction...')
+        bot.sendMessage(chatId, '🔨 Building and simulating mint transaction...').catch((error) => console.error('Build status notification failed:', error.message))
         const detectedFn = job.mint_function ? JSON.parse(job.mint_function) : null
         if (!detectedFn) throw new Error('No verified mint function is available for this job')
         const mintData = buildMintData(detectedFn, 1, wallet.address)
@@ -701,7 +715,6 @@ initDb().then(() => {
         const gasBoost = BigInt(Math.min(Math.max(Number(userSettings?.gas_boost || 2), 1), 20))
         const maxFeePerGas = (feeData.maxFeePerGas || feeData.gasPrice || ethers.parseUnits('30', 'gwei')) * gasBoost
         const maxPriorityFeePerGas = (feeData.maxPriorityFeePerGas || ethers.parseUnits('2', 'gwei')) * gasBoost
-        const nonce = await provider.getTransactionCount(wallet.address, 'pending')
         const txRequest = {
           to: job.contract_address,
           from: wallet.address,
@@ -711,11 +724,15 @@ initDb().then(() => {
           maxFeePerGas,
           maxPriorityFeePerGas,
         }
-        const estimatedGas = await provider.estimateGas(txRequest)
+        const [estimatedGas] = await Promise.all([
+          provider.estimateGas(txRequest),
+          provider.call(txRequest),
+        ])
         txRequest.gasLimit = estimatedGas > BigInt(job.gas_limit) ? estimatedGas : BigInt(job.gas_limit)
-        await provider.call(txRequest)
 
-        const tx = await signer.sendTransaction(txRequest)
+        const tx = job.mint_mode === 'fcfs'
+          ? await fcfsBroadcast(await signer.signTransaction(txRequest))
+          : await signer.sendTransaction(txRequest)
         // Update job
         db.prepare(`
           UPDATE mint_jobs 
@@ -791,6 +808,7 @@ initDb().then(() => {
         )
       } finally {
         executingJobs.delete(jobId)
+        walletLocks.delete(job.wallet_id)
       }
       return
     }
@@ -1761,6 +1779,7 @@ initDb().then(() => {
   async function executeScheduledMint(job) {
     const chatId = job.telegram_id
     console.log(`🚀 EXECUTING SCHEDULED MINT #${job.id} NOW!`)
+    walletLocks.add(job.wallet_id)
     
     try {
       // Get wallet
@@ -1771,51 +1790,37 @@ initDb().then(() => {
         return
       }
       
-      await bot.sendMessage(chatId, `🚀 *SCHEDULED MINT FIRING NOW!*\n\nJob #${job.id}`, { parse_mode: 'Markdown' })
+      bot.sendMessage(chatId, `🚀 *SCHEDULED MINT FIRING NOW!*\n\nJob #${job.id}`, { parse_mode: 'Markdown' }).catch((error) => console.error('Scheduled status notification failed:', error.message))
       
       // Decrypt key
       const privateKey = decryptPrivateKey(wallet.encrypted_key, job.telegram_id.toString())
       
       // Get provider
+      // getProvider validates mainnet when selecting or refreshing the cached provider.
       const provider = await getProvider()
-      const network = await provider.getNetwork()
-      if (network.chainId !== 1n) throw new Error('MintHunter currently supports Ethereum mainnet only')
       const signer = new ethers.Wallet(privateKey, provider)
       
-      // Check balance
-      const balance = await provider.getBalance(wallet.address)
+      // Parallelize network data fetching for minimum latency.
+      const [balance, nonce, feeData] = await Promise.all([
+        provider.getBalance(wallet.address),
+        provider.getTransactionCount(wallet.address, 'pending'),
+        provider.getFeeData(),
+      ])
+
       const baseMintCost = ethers.parseEther(job.mint_price || '0')
-      
-      // Check user settings (slippage + gas boost)
       const userSettings = db.prepare('SELECT slippage_enabled, gas_boost FROM users WHERE telegram_id = ?').get(job.telegram_id)
       const slippageEnabled = userSettings?.slippage_enabled === 1
-      
-      // Add 5% slippage buffer if enabled
-      const mintCost = slippageEnabled 
-        ? baseMintCost + (baseMintCost * 5n / 100n)
-        : baseMintCost
-      
+      const mintCost = slippageEnabled ? baseMintCost + (baseMintCost * 5n / 100n) : baseMintCost
       const fee = ethers.parseEther(FCFS_FEE)
       
-      // Get actual gas price from network
-      const balanceCheckFeeData = await provider.getFeeData()
-      const currentGasPrice = balanceCheckFeeData.gasPrice || ethers.parseUnits('30', 'gwei')
-      const gasBoostMultiplier = BigInt(userSettings?.gas_boost || 2)
-      const boostedGasPrice = currentGasPrice * gasBoostMultiplier
+      const gasBoost = BigInt(Math.min(Math.max(Number(userSettings?.gas_boost || 2), 1), 20))
+      const currentGasPrice = feeData.maxFeePerGas || feeData.gasPrice || ethers.parseUnits('30', 'gwei')
+      const boostedGasPrice = currentGasPrice * gasBoost
       const gasEstimate = BigInt(job.gas_limit) * boostedGasPrice
-      
       const totalNeeded = mintCost + fee + gasEstimate
       
-      // Debug log
-      const ethPrice = await getEthPrice()
-      console.log(`Balance check for job #${job.id}:`)
-      console.log(`  Balance: ${ethers.formatEther(balance)} ETH`)
-      console.log(`  Mint cost: ${ethers.formatEther(mintCost)} ETH`)
-      console.log(`  Fee: ${ethers.formatEther(fee)} ETH`)
-      console.log(`  Gas estimate: ${ethers.formatEther(gasEstimate)} ETH (${ethers.formatUnits(boostedGasPrice, 'gwei')} gwei x ${job.gas_limit})`)
-      console.log(`  Total needed: ${ethers.formatEther(totalNeeded)} ETH`)
-      
       if (balance < totalNeeded) {
+        const ethPrice = await getEthPrice()
         const shortfall = ethers.formatEther(totalNeeded - balance)
         const shortUsd = ethPrice ? (parseFloat(shortfall) * ethPrice).toFixed(2) : 'unavailable'
         const balanceUsd = ethPrice ? (parseFloat(ethers.formatEther(balance)) * ethPrice).toFixed(2) : 'unavailable'
@@ -1832,65 +1837,39 @@ initDb().then(() => {
         return
       }
       
-      // Execute mint with max speed. The fee is collected only after confirmation.
-      await bot.sendMessage(chatId, `⚡ Broadcasting mint to all RPCs...`)
+      // Execute mint with max speed.
+      bot.sendMessage(chatId, `⚡ Broadcasting mint to all RPCs...`).catch((error) => console.error('Broadcast status notification failed:', error.message))
       
-      // Build transaction
-      const nonce = await provider.getTransactionCount(wallet.address, 'pending')
-      const feeData = await provider.getFeeData()
-      
-      // Get gas boost from user settings (already fetched above)
-      const gasBoost = BigInt(userSettings?.gas_boost || 2)
-      
-      // Apply gas boost multiplier
-      const maxFeePerGas = feeData.maxFeePerGas ? feeData.maxFeePerGas * gasBoost : ethers.parseUnits('100', 'gwei') * gasBoost
-      const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ? feeData.maxPriorityFeePerGas * gasBoost : ethers.parseUnits('5', 'gwei') * gasBoost
-      
-      console.log(`⛽ Gas boost: ${gasBoost}x | maxFee: ${ethers.formatUnits(maxFeePerGas, 'gwei')} gwei`)
+      const maxFeePerGas = (feeData.maxFeePerGas || feeData.gasPrice || ethers.parseUnits('30', 'gwei')) * gasBoost
+      const maxPriorityFeePerGas = (feeData.maxPriorityFeePerGas || ethers.parseUnits('2', 'gwei')) * gasBoost
       
       // Scheduled jobs must carry verified ABI data created at scheduling time.
       const detectedFn = job.mint_function ? JSON.parse(job.mint_function) : null
       if (!detectedFn) throw new Error('Scheduled job has no verified mint function')
       const mintData = buildMintData(detectedFn, 1, wallet.address)
       if (!mintData || mintData === '0x') throw new Error('Scheduled mint calldata could not be built safely')
-      const estimatedMintGas = await provider.estimateGas({
+
+      const txData = {
         to: job.contract_address,
-        from: wallet.address,
         value: mintCost,
         data: mintData,
-      })
-      await provider.call({ to: job.contract_address, from: wallet.address, value: mintCost, data: mintData })
-      const gasLimit = estimatedMintGas > BigInt(job.gas_limit) ? estimatedMintGas : BigInt(job.gas_limit)
-      let tx
-      
-      try {
-        const txData = {
-          to: job.contract_address,
-          value: mintCost,
-          gasLimit,
-          maxFeePerGas,
-          maxPriorityFeePerGas,
-          nonce,
-          data: mintData
-        }
-        
-        const signedTx = await signer.signTransaction(txData)
-        
-        // FCFS Broadcast - Flashbots + All RPCs simultaneously
-        tx = await fcfsBroadcast(signedTx)
-        
-      } catch (e) {
-        // Fallback to regular send
-        tx = await signer.sendTransaction({
-          to: job.contract_address,
-          value: mintCost,
-          data: mintData,
-          nonce,
-          gasLimit,
-          maxFeePerGas,
-          maxPriorityFeePerGas
-        })
+        nonce,
+        maxFeePerGas,
+        maxPriorityFeePerGas,
       }
+
+      // Final on-chain validation before broadcast.
+      const [estimatedMintGas] = await Promise.all([
+        provider.estimateGas({ ...txData, from: wallet.address }),
+        provider.call({ ...txData, from: wallet.address }),
+      ])
+      txData.gasLimit = estimatedMintGas > BigInt(job.gas_limit) ? estimatedMintGas : BigInt(job.gas_limit)
+
+      const signedTx = await signer.signTransaction(txData)
+      const tx = job.mint_mode === 'fcfs'
+        ? await fcfsBroadcast(signedTx)
+        : await signer.sendTransaction(txData)
+
       
       db.prepare(`
         UPDATE mint_jobs SET status = 'executing', tx_hash = ?, executed_at = CURRENT_TIMESTAMP
@@ -1960,6 +1939,8 @@ initDb().then(() => {
         `${err.message?.slice(0, 200)}`,
         { parse_mode: 'Markdown' }
       )
+    } finally {
+      walletLocks.delete(job.wallet_id)
     }
   }
   
@@ -1982,6 +1963,11 @@ initDb().then(() => {
           WHERE id = ? AND status = 'scheduled'
         `).run(job.id)
         if (claimed.changes !== 1) continue
+        if (walletLocks.has(job.wallet_id)) {
+          console.log(`⏳ Skipping scheduled job #${job.id}: Wallet ${job.wallet_id} is locked`)
+          db.prepare("UPDATE mint_jobs SET status = 'scheduled' WHERE id = ?").run(job.id)
+          continue
+        }
         
         // Execute async (don't block the loop)
         executeScheduledMint(job).catch(e => {
