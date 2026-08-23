@@ -15,18 +15,44 @@ function resolveDbPath(env = process.env) {
 const DB_PATH = resolveDbPath()
 
 let db = null
+let SQL = null
 let initialized = false
+let diskFingerprint = null
+
+function getDiskFingerprint() {
+  try {
+    const stat = fs.statSync(DB_PATH)
+    return `${stat.mtimeMs}:${stat.size}`
+  } catch {
+    return null
+  }
+}
+
+function refreshFromDiskIfChanged() {
+  if (!db || !SQL || !fs.existsSync(DB_PATH)) return false
+
+  const currentFingerprint = getDiskFingerprint()
+  if (!currentFingerprint || currentFingerprint === diskFingerprint) return false
+
+  const buffer = fs.readFileSync(DB_PATH)
+  db.close?.()
+  db = new SQL.Database(buffer)
+  diskFingerprint = currentFingerprint
+  console.log('💾 Database refreshed from disk')
+  return true
+}
 
 async function initDb() {
   if (initialized) return db
 
-  const SQL = await initSqlJs()
+  SQL = await initSqlJs()
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
 
   // Load existing db or create new
   if (fs.existsSync(DB_PATH)) {
     const buffer = fs.readFileSync(DB_PATH)
     db = new SQL.Database(buffer)
+    diskFingerprint = getDiskFingerprint()
     console.log('💾 Database loaded from disk')
   } else {
     db = new SQL.Database()
@@ -171,11 +197,13 @@ async function initDb() {
 // Save to disk
 function save() {
   if (db) {
+    refreshFromDiskIfChanged()
     const data = db.export()
     const buffer = Buffer.from(data)
     const tempPath = `${DB_PATH}.tmp`
     fs.writeFileSync(tempPath, buffer)
     fs.renameSync(tempPath, DB_PATH)
+    diskFingerprint = getDiskFingerprint()
   }
 }
 
@@ -184,6 +212,7 @@ const dbWrapper = {
   prepare: (sql) => ({
     run: (...params) => {
       if (!db) throw new Error('DB not initialized - call initDb() first')
+      refreshFromDiskIfChanged()
       
       // For INSERTs, we need to get the ID after
       const isInsert = sql.trim().toUpperCase().startsWith('INSERT')
@@ -201,6 +230,7 @@ const dbWrapper = {
     },
     get: (...params) => {
       if (!db) throw new Error('DB not initialized - call initDb() first')
+      refreshFromDiskIfChanged()
       const stmt = db.prepare(sql)
       stmt.bind(params)
       if (stmt.step()) {
@@ -213,6 +243,7 @@ const dbWrapper = {
     },
     all: (...params) => {
       if (!db) throw new Error('DB not initialized - call initDb() first')
+      refreshFromDiskIfChanged()
       const stmt = db.prepare(sql)
       stmt.bind(params)
       const results = []
@@ -226,6 +257,7 @@ const dbWrapper = {
   // Direct exec for raw SQL
   exec: (sql) => {
     if (!db) throw new Error('DB not initialized - call initDb() first')
+    refreshFromDiskIfChanged()
     db.run(sql)
     save()
   }
@@ -235,3 +267,4 @@ module.exports = dbWrapper
 module.exports.initDb = initDb
 module.exports.save = save
 module.exports.resolveDbPath = resolveDbPath
+module.exports.refreshFromDiskIfChanged = refreshFromDiskIfChanged
