@@ -5,7 +5,7 @@
 
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') })
 const http = require('node:http')
-const TelegramBot = require('node-telegram-bot-api')
+const { TelegramBotAdapter } = require('./telegram-adapter')
 const { initDb } = require('./db')
 const db = require('./db')
 const { mainMenu, settingsMenu, gasBoostMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
@@ -94,7 +94,7 @@ if (!process.env.BOT_TOKEN) {
 }
 
 // Create bot
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true })
+const bot = new TelegramBotAdapter(process.env.BOT_TOKEN, { polling: true })
 console.log('🎯 MintHunter starting...')
 
 let applicationReady = false
