@@ -3,7 +3,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
-const test = require('node:test')
+const { test, after } = require('node:test')
 
 const volumePath = fs.mkdtempSync(path.join(os.tmpdir(), 'minthunter-db-sync-'))
 process.env.RAILWAY_VOLUME_MOUNT_PATH = volumePath
@@ -11,9 +11,9 @@ process.env.RAILWAY_VOLUME_MOUNT_PATH = volumePath
 const db = require('../src/db')
 const generator = path.join(__dirname, '..', 'scripts', 'generate-codes.js')
 
-test('refreshes a console-created access-code batch before saving bot writes', async (t) => {
-  t.after(() => fs.rmSync(volumePath, { recursive: true, force: true }))
+after(() => fs.rmSync(volumePath, { recursive: true, force: true }))
 
+test('refreshes a console-created access-code batch before saving bot writes', async () => {
   await db.initDb()
   db.prepare('INSERT INTO users (telegram_id, username) VALUES (?, ?)').run(1, 'first-user')
 
@@ -31,4 +31,22 @@ test('refreshes a console-created access-code batch before saving bot writes', a
   const accessCode = db.prepare('SELECT code, used_by FROM access_codes WHERE code = ?').get(generatedCode)
   assert.equal(accessCode.code, generatedCode)
   assert.equal(accessCode.used_by, null)
+})
+
+test('reports update changes before persistence and restores interrupted access-code claims', () => {
+  const claimUserId = 3
+  db.prepare('INSERT INTO users (telegram_id, username, is_authorized) VALUES (?, ?, 0)').run(claimUserId, 'claim-user')
+  db.prepare('INSERT INTO access_codes (code, used_by, used_at, expires_at) VALUES (?, ?, datetime(\'now\'), datetime(\'now\', \'+30 days\'))')
+    .run('MH-ABC123', claimUserId)
+
+  const claimed = db.prepare('UPDATE access_codes SET used_at = datetime(\'now\') WHERE code = ? AND used_by IS NOT NULL')
+    .run('MH-ABC123')
+  assert.equal(claimed.changes, 1)
+
+  const recovered = db.reconcileInterruptedAccessCodeClaims()
+  assert.equal(recovered, 1)
+
+  const user = db.prepare('SELECT is_authorized, access_expires FROM users WHERE telegram_id = ?').get(claimUserId)
+  assert.equal(user.is_authorized, 1)
+  assert.ok(new Date(user.access_expires) > new Date())
 })

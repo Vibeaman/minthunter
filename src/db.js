@@ -42,6 +42,31 @@ function refreshFromDiskIfChanged() {
   return true
 }
 
+function reconcileInterruptedAccessCodeClaims() {
+  if (!db) return 0
+
+  db.run(`
+    UPDATE users
+    SET
+      is_authorized = 1,
+      access_expires = (
+        SELECT strftime('%Y-%m-%dT%H:%M:%fZ', datetime(access_codes.used_at, '+30 days'))
+        FROM access_codes
+        WHERE access_codes.used_by = users.telegram_id
+        ORDER BY access_codes.used_at DESC
+        LIMIT 1
+      )
+    WHERE (users.is_authorized IS NULL OR users.is_authorized = 0)
+      AND EXISTS (
+        SELECT 1
+        FROM access_codes
+        WHERE access_codes.used_by = users.telegram_id
+      )
+  `)
+
+  return db.getRowsModified()
+}
+
 async function initDb() {
   if (initialized) return db
 
@@ -187,6 +212,11 @@ async function initDb() {
   db.run('CREATE INDEX IF NOT EXISTS idx_mint_jobs_status_schedule ON mint_jobs(status, scheduled_at)')
   db.run('CREATE INDEX IF NOT EXISTS idx_mint_jobs_user_status ON mint_jobs(telegram_id, status)')
 
+  const recoveredClaims = reconcileInterruptedAccessCodeClaims()
+  if (recoveredClaims > 0) {
+    console.log(`🔐 Restored ${recoveredClaims} access-code authorization(s) after an interrupted claim response`)
+  }
+
   save()
 
   initialized = true
@@ -218,6 +248,7 @@ const dbWrapper = {
       const isInsert = sql.trim().toUpperCase().startsWith('INSERT')
       
       db.run(sql, params)
+      const changes = db.getRowsModified()
       save()
       
       let lastId = 0
@@ -226,7 +257,7 @@ const dbWrapper = {
         lastId = result[0]?.values?.[0]?.[0] || 0
       }
       
-      return { lastInsertRowid: lastId, changes: db.getRowsModified() }
+      return { lastInsertRowid: lastId, changes }
     },
     get: (...params) => {
       if (!db) throw new Error('DB not initialized - call initDb() first')
@@ -268,3 +299,4 @@ module.exports.initDb = initDb
 module.exports.save = save
 module.exports.resolveDbPath = resolveDbPath
 module.exports.refreshFromDiskIfChanged = refreshFromDiskIfChanged
+module.exports.reconcileInterruptedAccessCodeClaims = reconcileInterruptedAccessCodeClaims

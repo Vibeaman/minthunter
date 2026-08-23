@@ -14,5 +14,6 @@
 - [x] Verify the Railway deployment is active and the Telegram bot is ready.
 - [x] Configure the FCFS service fee as a fixed ETH value that approximates the user’s intended US$1 fee, and document that its USD value will vary with ETH price.
 - [x] Fix the Railway runtime `TelegramBot is not a constructor` startup failure and redeploy the verified compatibility patch.
-- [ ] Generate and securely deliver 30 one-time Mint Hunter access codes, each valid for redemption for 30 days.
+- [x] Generate and securely deliver 30 one-time Mint Hunter access codes, each valid for redemption for 30 days.
 - [x] Prevent the live bot from overwriting access codes created by a separate Railway console process before generating the first production batch.
+- [ ] Diagnose and fix the live access-code redemption path after a freshly generated, unused code was rejected as used or expired.
