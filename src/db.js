@@ -7,7 +7,12 @@ const initSqlJs = require('sql.js')
 const fs = require('fs')
 const path = require('path')
 
-const DB_PATH = path.join(__dirname, '..', 'minthunter.db')
+function resolveDbPath(env = process.env) {
+  const directory = env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, '..')
+  return path.join(directory, 'minthunter.db')
+}
+
+const DB_PATH = resolveDbPath()
 
 let db = null
 let initialized = false
@@ -16,6 +21,7 @@ async function initDb() {
   if (initialized) return db
 
   const SQL = await initSqlJs()
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
 
   // Load existing db or create new
   if (fs.existsSync(DB_PATH)) {
@@ -228,3 +234,4 @@ const dbWrapper = {
 module.exports = dbWrapper
 module.exports.initDb = initDb
 module.exports.save = save
+module.exports.resolveDbPath = resolveDbPath

@@ -14,6 +14,8 @@ const {
 } = require('../src/security')
 const { buildMintData } = require('../src/services/contract')
 const { firstSuccessfulBroadcast } = require('../src/provider')
+const { resolveDbPath } = require('../src/db')
+const { calculateTransactionCosts } = require('../src/transaction-costs')
 
 const privateKey = `0x${'22'.repeat(32)}`
 const walletAddress = validatePrivateKey(privateKey).address
@@ -83,4 +85,19 @@ test('FCFS broadcast returns on the first accepted RPC', async () => {
 
   await new Promise((resolve) => setTimeout(resolve, 100))
   assert.equal(slowSettled, true)
+})
+
+test('Railway volume database path and transaction costs are calculated safely', () => {
+  assert.equal(resolveDbPath({ RAILWAY_VOLUME_MOUNT_PATH: '/data' }), '/data/minthunter.db')
+  assert.match(resolveDbPath({}), /minthunter\.db$/)
+
+  const { gasCost, totalCost } = calculateTransactionCosts({
+    mintCost: 50n,
+    gasLimit: 21_000n,
+    gasPrice: 3n,
+    serviceFee: 7n,
+  })
+  assert.equal(gasCost, 63_000n)
+  assert.equal(totalCost, 63_057n)
+  assert.throws(() => calculateTransactionCosts({ mintCost: 1n, gasLimit: 1n, gasPrice: -1n }))
 })

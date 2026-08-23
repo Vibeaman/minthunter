@@ -4,6 +4,7 @@
  */
 
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') })
+const http = require('node:http')
 const TelegramBot = require('node-telegram-bot-api')
 const { initDb } = require('./db')
 const db = require('./db')
@@ -13,6 +14,7 @@ const { getProvider, broadcastToAll, fcfsBroadcast } = require('./provider')
 const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./services/floor')
 const { analyzeContract, buildMintData } = require('./services/contract')
 const { ethers } = require('ethers')
+const { calculateTransactionCosts } = require('./transaction-costs')
 const {
   isPrivateChat,
   normalizeAccessCode,
@@ -95,6 +97,45 @@ if (!process.env.BOT_TOKEN) {
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true })
 console.log('🎯 MintHunter starting...')
 
+let applicationReady = false
+let healthServer = null
+let alertCheckStartTimer = null
+let alertCheckTimer = null
+let scheduledMintTimer = null
+let alertCheckInProgress = false
+let shuttingDown = false
+
+function startHealthServer() {
+  const port = Number(process.env.PORT)
+  if (!Number.isInteger(port) || port <= 0) return
+
+  healthServer = http.createServer((request, response) => {
+    const pathname = new URL(request.url || '/', 'http://localhost').pathname
+    if (request.method !== 'GET' || pathname !== '/health') {
+      response.writeHead(404, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ status: 'not_found' }))
+      return
+    }
+
+    response.writeHead(applicationReady ? 200 : 503, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ status: applicationReady ? 'ok' : 'starting' }))
+  })
+
+  healthServer.on('error', (error) => {
+    console.error('Health server error:', error.message)
+    shutdown('health server error', 1).catch((shutdownError) => {
+      console.error('Health-server shutdown failed:', shutdownError)
+      process.exit(1)
+    })
+  })
+
+  healthServer.listen(port, '0.0.0.0', () => {
+    console.log(`🩺 Health endpoint listening on port ${port}`)
+  })
+}
+
+startHealthServer()
+
 // Track user state for multi-step flows
 const userState = new Map()
 const executingJobs = new Set()
@@ -120,7 +161,7 @@ function requirePrivateChat(msg) {
 }
 
 // Initialize database then start bot
-initDb().then(() => {
+initDb().then(async () => {
   console.log('💾 Database ready')
   
   // /start command
@@ -540,14 +581,19 @@ initDb().then(() => {
         const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || ethers.parseUnits('20', 'gwei')
         const gasLimit = estimatedGas
         const fee = job.mint_mode !== 'normal' ? ethers.parseEther(FCFS_FEE) : 0n
-        const totalCost = mintCost + estimatedGas + fee
+        const { gasCost, totalCost } = calculateTransactionCosts({
+          mintCost,
+          gasLimit,
+          gasPrice,
+          serviceFee: fee,
+        })
         
         // Get wallet balance
         const balance = await provider.getBalance(wallet.address)
         
         // Format values
         const mintEth = ethers.formatEther(mintCost)
-        const gasEth = ethers.formatEther(estimatedGas)
+        const gasEth = ethers.formatEther(gasCost)
         const feeEth = ethers.formatEther(fee)
         const totalEth = ethers.formatEther(totalCost)
         const balanceEth = ethers.formatEther(balance)
@@ -563,7 +609,7 @@ initDb().then(() => {
         const statusText = hasEnough ? 'Ready to mint!' : 'Insufficient balance'
         
         // Gas price in gwei
-        const gasPriceGwei = (Number(gasPrice) / 1e9).toFixed(2)
+        const gasPriceGwei = Number(ethers.formatUnits(gasPrice, 'gwei')).toFixed(2)
         
         await bot.sendMessage(chatId,
           `🔍 *Simulation Results*\n\n` +
@@ -681,10 +727,14 @@ initDb().then(() => {
 
         // Get actual gas price from network
         const currentGasPrice = feeData.gasPrice || ethers.parseUnits('30', 'gwei')
-        const gasBoostMultiplier = BigInt(userSettings?.gas_boost || 2)
-        const boostedGasPrice = currentGasPrice * gasBoostMultiplier
-        const gasEstimate = BigInt(job.gas_limit) * boostedGasPrice
-        const totalNeeded = mintCost + fee + gasEstimate
+          const gasBoostMultiplier = BigInt(userSettings?.gas_boost || 2)
+          const projectedMaxFeePerGas = (feeData.maxFeePerGas || currentGasPrice) * gasBoostMultiplier
+          const { totalCost: totalNeeded } = calculateTransactionCosts({
+            mintCost,
+            gasLimit: BigInt(job.gas_limit),
+            gasPrice: projectedMaxFeePerGas,
+            serviceFee: fee,
+          })
         
         if (balance < totalNeeded) {
           const shortfall = ethers.formatEther(totalNeeded - balance)
@@ -1756,6 +1806,8 @@ initDb().then(() => {
   const ALERT_CHECK_INTERVAL = 5 * 60 * 1000 // 5 minutes
   
   async function runAlertCheck() {
+    if (alertCheckInProgress || shuttingDown) return
+    alertCheckInProgress = true
     try {
       const triggered = await checkAlerts(db, bot)
       if (triggered.length > 0) {
@@ -1763,14 +1815,16 @@ initDb().then(() => {
       }
     } catch (e) {
       console.error('Alert check error:', e.message)
+    } finally {
+      alertCheckInProgress = false
     }
   }
   
   // Initial check after 30 seconds
-  setTimeout(runAlertCheck, 30000)
+  alertCheckStartTimer = setTimeout(runAlertCheck, 30000)
   
   // Then check every 5 minutes
-  setInterval(runAlertCheck, ALERT_CHECK_INTERVAL)
+  alertCheckTimer = setInterval(runAlertCheck, ALERT_CHECK_INTERVAL)
 
   // ========== SCHEDULED MINT EXECUTOR ==========
   // Check every second for scheduled mints (need precision!)
@@ -1815,9 +1869,12 @@ initDb().then(() => {
       
       const gasBoost = BigInt(Math.min(Math.max(Number(userSettings?.gas_boost || 2), 1), 20))
       const currentGasPrice = feeData.maxFeePerGas || feeData.gasPrice || ethers.parseUnits('30', 'gwei')
-      const boostedGasPrice = currentGasPrice * gasBoost
-      const gasEstimate = BigInt(job.gas_limit) * boostedGasPrice
-      const totalNeeded = mintCost + fee + gasEstimate
+      const { totalCost: totalNeeded } = calculateTransactionCosts({
+        mintCost,
+        gasLimit: BigInt(job.gas_limit),
+        gasPrice: currentGasPrice * gasBoost,
+        serviceFee: fee,
+      })
       
       if (balance < totalNeeded) {
         const ethPrice = await getEthPrice()
@@ -1945,6 +2002,7 @@ initDb().then(() => {
   }
   
   async function checkScheduledMints() {
+    if (shuttingDown) return
     try {
       const now = new Date()
       
@@ -1981,8 +2039,11 @@ initDb().then(() => {
   }
   
   // Check every second for scheduled mints
-  setInterval(checkScheduledMints, SCHEDULE_CHECK_INTERVAL)
+  scheduledMintTimer = setInterval(checkScheduledMints, SCHEDULE_CHECK_INTERVAL)
   
+  const botIdentity = await bot.getMe()
+  console.log(`🤖 Telegram connection verified for @${botIdentity.username || botIdentity.id}`)
+  applicationReady = true
   console.log('✅ MintHunter ready!')
   console.log('🔔 Floor alerts checking every 5 minutes')
   console.log('⏰ Scheduled mints checking every 1 second')
@@ -1995,18 +2056,36 @@ initDb().then(() => {
 // Centralized process and Telegram error handling.
 bot.on('polling_error', (error) => console.error('Telegram polling error:', error.message))
 bot.on('error', (error) => console.error('Telegram bot error:', error.message))
-process.on('unhandledRejection', (error) => console.error('Unhandled rejection:', error))
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled rejection:', error)
+  shutdown('unhandled rejection', 1).catch((shutdownError) => {
+    console.error('Unhandled-rejection shutdown failed:', shutdownError)
+    process.exit(1)
+  })
+})
 process.on('uncaughtException', (error) => {
   console.error('Uncaught exception:', error)
-  process.exitCode = 1
+  shutdown('uncaught exception', 1).catch((shutdownError) => {
+    console.error('Uncaught-exception shutdown failed:', shutdownError)
+    process.exit(1)
+  })
 })
 
 // Graceful shutdown
-async function shutdown(signal) {
+async function shutdown(signal, exitCode = 0) {
+  if (shuttingDown) return
+  shuttingDown = true
+  applicationReady = false
   console.log(`👋 Shutting down after ${signal}...`)
-  bot.stopPolling()
+  clearTimeout(alertCheckStartTimer)
+  clearInterval(alertCheckTimer)
+  clearInterval(scheduledMintTimer)
+  try { await bot.stopPolling() } catch (error) { console.error('Telegram polling shutdown failed:', error.message) }
+  if (healthServer?.listening) {
+    await new Promise((resolve) => healthServer.close(resolve))
+  }
   try { db.save() } catch (error) { console.error('Database flush failed:', error.message) }
-  process.exit(0)
+  process.exit(exitCode)
 }
 process.once('SIGINT', () => shutdown('SIGINT'))
 process.once('SIGTERM', () => shutdown('SIGTERM'))
