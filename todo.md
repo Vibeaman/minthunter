@@ -8,9 +8,9 @@
 - [x] Correct mint simulation gas-fee and total-cost calculations.
 - [x] Ensure scheduled intervals and Telegram polling shut down cleanly during Railway redeploys.
 - [ ] Deploy Mint Hunter to Railway after the user confirms the target project and attaches a persistent volume.
-- [ ] Create or connect the Mint Hunter Railway service from the GitHub repository.
-- [ ] Attach a Railway persistent volume at `/data` before first production start.
+- [x] Create or connect the Mint Hunter Railway service from the GitHub repository.
+- [x] Attach a Railway persistent volume at `/data` before first production start.
 - [ ] Configure the required Railway service variables and verify the `/health` deployment check.
 - [ ] Verify the Railway deployment is active and the Telegram bot is ready.
-- [ ] Configure the FCFS service fee as a fixed ETH value that approximates the user’s intended US$1 fee, and document that its USD value will vary with ETH price.
+- [x] Configure the FCFS service fee as a fixed ETH value that approximates the user’s intended US$1 fee, and document that its USD value will vary with ETH price.
 - [x] Fix the Railway runtime `TelegramBot is not a constructor` startup failure and redeploy the verified compatibility patch.
