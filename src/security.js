@@ -21,7 +21,15 @@ function parseEthAmount(value, { allowZero = true } = {}) {
 }
 
 function normalizeAccessCode(value) {
-  const code = String(value ?? '').trim().toUpperCase()
+  const code = String(value ?? '')
+    .trim()
+    .replace(/^["'`\u2018\u2019\u201C\u201D]+|["'`\u2018\u2019\u201C\u201D]+$/g, '')
+    .trim()
+    .toUpperCase()
+    // Access codes are generated as uppercase hexadecimal, so these mappings
+    // cannot turn one valid generated code into another valid generated code.
+    .replace(/O/g, '0')
+    .replace(/[IL]/g, '1')
   return /^MH-[A-F0-9]{6}$/.test(code) ? code : null
 }
 

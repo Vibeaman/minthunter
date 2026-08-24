@@ -22,7 +22,9 @@ const walletAddress = validatePrivateKey(privateKey).address
 
 test('strict access-code and callback parsing', () => {
   assert.equal(normalizeAccessCode(' mh-13cfc7 '), 'MH-13CFC7')
+  assert.equal(normalizeAccessCode("'mh-aob88l'"), 'MH-A0B881')
   assert.equal(normalizeAccessCode('MH-123'), null)
+  assert.equal(normalizeAccessCode('MH-GGGGGG'), null)
   assert.equal(parseCallbackId('mint_execute_42', 'mint_execute_'), 42)
   assert.equal(parseCallbackId('mint_execute_x', 'mint_execute_'), null)
 })
