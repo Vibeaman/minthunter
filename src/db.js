@@ -6,6 +6,7 @@
 const initSqlJs = require('sql.js')
 const fs = require('fs')
 const path = require('path')
+const { DEFAULT_CHAIN } = require('./chains')
 
 function resolveDbPath(env = process.env) {
   const directory = env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, '..')
@@ -202,6 +203,25 @@ async function initDb() {
     // Column already exists
   }
 
+  // Multi-chain support (Phase 2): every wallet, alert, and mint job belongs
+  // to a chain from src/chains.js. Existing rows predate chain selection, so
+  // they migrate to 'ethereum' - MintHunter's only chain before this change.
+  try {
+    db.run(`ALTER TABLE wallets ADD COLUMN chain TEXT NOT NULL DEFAULT '${DEFAULT_CHAIN}'`)
+  } catch (e) {
+    // Column already exists
+  }
+  try {
+    db.run(`ALTER TABLE floor_alerts ADD COLUMN chain TEXT NOT NULL DEFAULT '${DEFAULT_CHAIN}'`)
+  } catch (e) {
+    // Column already exists
+  }
+  try {
+    db.run(`ALTER TABLE mint_jobs ADD COLUMN chain TEXT NOT NULL DEFAULT '${DEFAULT_CHAIN}'`)
+  } catch (e) {
+    // Column already exists
+  }
+
   // Keep existing authorization state across restarts. Expiry is checked at use time.
   try {
     db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_wallets_user_address ON wallets(telegram_id, address)')
@@ -211,6 +231,9 @@ async function initDb() {
   db.run('CREATE INDEX IF NOT EXISTS idx_alerts_active_collection ON floor_alerts(is_active, collection_address)')
   db.run('CREATE INDEX IF NOT EXISTS idx_mint_jobs_status_schedule ON mint_jobs(status, scheduled_at)')
   db.run('CREATE INDEX IF NOT EXISTS idx_mint_jobs_user_status ON mint_jobs(telegram_id, status)')
+  db.run('CREATE INDEX IF NOT EXISTS idx_wallets_user_chain ON wallets(telegram_id, chain)')
+  db.run('CREATE INDEX IF NOT EXISTS idx_alerts_user_chain ON floor_alerts(telegram_id, chain)')
+  db.run('CREATE INDEX IF NOT EXISTS idx_mint_jobs_user_chain ON mint_jobs(telegram_id, chain)')
 
   const recoveredClaims = reconcileInterruptedAccessCodeClaims()
   if (recoveredClaims > 0) {

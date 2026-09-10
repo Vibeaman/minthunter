@@ -15,6 +15,7 @@ const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./serv
 const { analyzeContract, buildMintData } = require('./services/contract')
 const { ethers } = require('ethers')
 const { calculateTransactionCosts } = require('./transaction-costs')
+const { DEFAULT_CHAIN } = require('./chains')
 const {
   isPrivateChat,
   normalizeAccessCode,
@@ -560,8 +561,8 @@ initDb().then(async () => {
       
       const result = db.prepare(`
         INSERT INTO mint_jobs 
-        (telegram_id, wallet_id, contract_address, mint_function, mint_price, mint_mode, gas_limit, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+        (telegram_id, wallet_id, contract_address, mint_function, mint_price, mint_mode, gas_limit, status, chain)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
       `).run(
         userId,
         state.walletId,
@@ -569,7 +570,8 @@ initDb().then(async () => {
         mintFunctionJson,
         state.mintPrice,
         state.mode,
-        Math.floor(250000 * gasMultiplier)
+        Math.floor(250000 * gasMultiplier),
+        DEFAULT_CHAIN // TODO(Phase 3): use the user's selected active chain
       )
       
       const jobId = result.lastInsertRowid
@@ -1142,14 +1144,15 @@ initDb().then(async () => {
       // Create the alert
       const result = db.prepare(`
         INSERT INTO floor_alerts 
-        (telegram_id, collection_address, collection_name, target_price, condition, is_active)
-        VALUES (?, ?, ?, ?, ?, 1)
+        (telegram_id, collection_address, collection_name, target_price, condition, is_active, chain)
+        VALUES (?, ?, ?, ?, ?, 1, ?)
       `).run(
         userId,
         state.collection,
         state.collectionName || 'Unknown',
         state.alertPrice,
-        condition
+        condition,
+        DEFAULT_CHAIN // TODO(Phase 3): use the user's selected active chain
       )
       
       const alertId = result.lastInsertRowid
@@ -1690,8 +1693,8 @@ initDb().then(async () => {
       // Create a scheduled FCFS job with the verified ABI function attached.
       const result = db.prepare(`
         INSERT INTO mint_jobs
-        (telegram_id, wallet_id, contract_address, mint_function, mint_price, mint_mode, gas_limit, status, scheduled_at)
-        VALUES (?, ?, ?, ?, ?, 'fcfs', ?, 'scheduled', ?)
+        (telegram_id, wallet_id, contract_address, mint_function, mint_price, mint_mode, gas_limit, status, scheduled_at, chain)
+        VALUES (?, ?, ?, ?, ?, 'fcfs', ?, 'scheduled', ?, ?)
       `).run(
         userId,
         state.walletId,
@@ -1699,7 +1702,8 @@ initDb().then(async () => {
         JSON.stringify(analysis.recommendedMint),
         state.mintPrice,
         375000,
-        scheduledDate.toISOString()
+        scheduledDate.toISOString(),
+        DEFAULT_CHAIN // TODO(Phase 3): use the user's selected active chain
       )
       
       const jobId = result.lastInsertRowid
@@ -1867,8 +1871,8 @@ initDb().then(async () => {
         const encrypted = encryptPrivateKey(key, userId.toString())
         try {
           db.prepare(
-            'INSERT INTO wallets (telegram_id, address, encrypted_key, label) VALUES (?, ?, ?, ?)'
-          ).run(userId, address, encrypted, 'Wallet')
+            'INSERT INTO wallets (telegram_id, address, encrypted_key, label, chain) VALUES (?, ?, ?, ?, ?)'
+          ).run(userId, address, encrypted, 'Wallet', DEFAULT_CHAIN) // TODO(Phase 3): use the user's selected active chain
         } catch (insertError) {
           if (String(insertError.message).toLowerCase().includes('unique')) {
             await bot.sendMessage(chatId, '❌ That wallet is already added.', { reply_markup: walletsMenu })
