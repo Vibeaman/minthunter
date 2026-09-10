@@ -7,6 +7,7 @@ const axios = require('axios')
 const path = require('path')
 const { ethers } = require('ethers')
 require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') })
+const { getChain, DEFAULT_CHAIN } = require('../chains')
 
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || ''
 
@@ -23,46 +24,56 @@ const PRICE_PATTERNS = [
 ]
 
 /**
- * Fetch contract ABI from Etherscan.
- * Etherscan's v2 API requires a valid API key on every request - there is no
- * keyless fallback anymore. If the key is missing/invalid, Etherscan replies
- * with "Missing/Invalid API Key", which must NOT be confused with the
- * contract genuinely being unverified.
+ * Parse a raw Etherscan-shaped explorer response ({status, message, result})
+ * into an ABI array, or throw a coded error. Both Etherscan v2 and
+ * Blockscout's Etherscan-compat `/api` endpoint return this same shape for
+ * `module=contract&action=getabi`, so a single parser covers both.
  */
-async function fetchABI(contractAddress) {
-  if (!ETHERSCAN_API_KEY) {
-    const err = new Error('ETHERSCAN_API_KEY is not configured')
+function parseGetAbiResponse(response, explorerLabel) {
+  if (response.data.status === '1' && response.data.result) {
+    return JSON.parse(response.data.result)
+  }
+
+  const resultMsg = typeof response.data.result === 'string' ? response.data.result : ''
+
+  if (/invalid api key/i.test(resultMsg) || /missing.*api key/i.test(resultMsg)) {
+    const err = new Error(`${explorerLabel} rejected the configured API key`)
+    err.code = 'INVALID_API_KEY'
+    throw err
+  }
+
+  if (/rate limit/i.test(resultMsg)) {
+    const err = new Error(`${explorerLabel} API rate limit reached, please retry shortly`)
+    err.code = 'RATE_LIMITED'
+    throw err
+  }
+
+  // Genuinely unverified/no ABI on record
+  return null
+}
+
+/**
+ * Fetch contract ABI from Etherscan v2. Etherscan's v2 API requires a valid
+ * API key and a `chainid=` param on every request - there is no keyless
+ * fallback. If the key is missing/invalid, Etherscan replies with
+ * "Missing/Invalid API Key", which must NOT be confused with the contract
+ * genuinely being unverified.
+ */
+async function fetchABIFromEtherscanV2(contractAddress, chainConfig) {
+  const apiKey = process.env[chainConfig.explorer.apiKeyEnvKey] || ETHERSCAN_API_KEY
+
+  if (!apiKey) {
+    const err = new Error(`${chainConfig.explorer.apiKeyEnvKey} is not configured`)
     err.code = 'NO_API_KEY'
     throw err
   }
 
   try {
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address=${contractAddress}&apikey=${ETHERSCAN_API_KEY}`
-
+    const url = `${chainConfig.explorer.apiUrl}?chainid=${chainConfig.chainId}&module=contract&action=getabi&address=${contractAddress}&apikey=${apiKey}`
     const response = await axios.get(url, { timeout: 10000 })
-
-    if (response.data.status === '1' && response.data.result) {
-      return JSON.parse(response.data.result)
-    }
-
-    const resultMsg = typeof response.data.result === 'string' ? response.data.result : ''
-
-    if (/invalid api key/i.test(resultMsg) || /missing.*api key/i.test(resultMsg)) {
-      const err = new Error('Etherscan rejected the configured API key')
-      err.code = 'INVALID_API_KEY'
-      throw err
-    }
-
-    if (/rate limit/i.test(resultMsg)) {
-      const err = new Error('Etherscan API rate limit reached, please retry shortly')
-      err.code = 'RATE_LIMITED'
-      throw err
-    }
-
-    // Genuinely unverified/no ABI on record
-    return null
+    return parseGetAbiResponse(response, 'Etherscan')
   } catch (error) {
-    if (error.code === 'NO_API_KEY' || error.code === 'INVALID_API_KEY' || error.code === 'RATE_LIMITED') {
+    if (error.code === 'INVALID_API_KEY' || error.code === 'RATE_LIMITED') {
       throw error
     }
     console.error('Etherscan ABI fetch error:', error.message)
@@ -70,6 +81,55 @@ async function fetchABI(contractAddress) {
     err.code = 'REQUEST_FAILED'
     throw err
   }
+}
+
+/**
+ * Fetch contract ABI from Blockscout's Etherscan-compatible `/api` endpoint
+ * (module=contract&action=getabi - NOT the newer `/api/v2/...` REST style).
+ * Blockscout works keyless at low volume, so a missing API key is NOT an
+ * error here - it's only appended if configured, to raise rate limits.
+ */
+async function fetchABIFromBlockscoutCompat(contractAddress, chainConfig) {
+  const apiKey = process.env[chainConfig.explorer.apiKeyEnvKey]
+  const apiKeyParam = apiKey ? `&apikey=${apiKey}` : ''
+
+  try {
+    const url = `${chainConfig.explorer.apiUrl}?module=contract&action=getabi&address=${contractAddress}${apiKeyParam}`
+    const response = await axios.get(url, { timeout: 10000 })
+    return parseGetAbiResponse(response, 'Blockscout')
+  } catch (error) {
+    if (error.code === 'INVALID_API_KEY' || error.code === 'RATE_LIMITED') {
+      throw error
+    }
+    console.error('Blockscout ABI fetch error:', error.message)
+    const err = new Error(`Blockscout request failed: ${error.message}`)
+    err.code = 'REQUEST_FAILED'
+    throw err
+  }
+}
+
+/**
+ * Fetch contract ABI from the verified-source explorer configured for the
+ * given chain. Routes to the correct API style per chains.js's
+ * `explorer.apiStyle` - Etherscan v2 (chainid + mandatory API key) for
+ * Ethereum, Blockscout's Etherscan-compat API (keyless-capable) for
+ * Robinhood Chain and any future Blockscout-based chain.
+ */
+async function fetchABI(contractAddress, chain = DEFAULT_CHAIN) {
+  const chainConfig = getChain(chain)
+  const apiStyle = chainConfig.explorer.apiStyle
+
+  if (apiStyle === 'etherscan-v2') {
+    return fetchABIFromEtherscanV2(contractAddress, chainConfig)
+  }
+
+  if (apiStyle === 'blockscout-etherscan-compat') {
+    return fetchABIFromBlockscoutCompat(contractAddress, chainConfig)
+  }
+
+  const err = new Error(`Unsupported explorer API style "${apiStyle}" for chain ${chainConfig.name}`)
+  err.code = 'UNSUPPORTED_EXPLORER'
+  throw err
 }
 
 /**
@@ -224,13 +284,20 @@ async function getMintPrice(contractAddress, provider, priceFunctions) {
 }
 
 /**
- * Analyze contract and return mint details
+ * Analyze contract and return mint details.
+ * `chain` selects which explorer (Etherscan v2, Blockscout compat, ...) is
+ * used to fetch the ABI, per chains.js. Defaults to DEFAULT_CHAIN so
+ * existing Ethereum-only call sites keep working unchanged.
  */
-async function analyzeContract(contractAddress, provider) {
+async function analyzeContract(contractAddress, provider, chain = DEFAULT_CHAIN) {
   console.log(`🔍 Analyzing contract: ${contractAddress}`)
-  
+
+  const chainConfig = getChain(chain)
+  const explorerLabel = chainConfig.explorer.apiStyle === 'etherscan-v2' ? 'Etherscan' : 'Blockscout'
+
   const result = {
     address: contractAddress,
+    chain: chainConfig.id,
     verified: false,
     mintFunctions: [],
     priceFunctions: [],
@@ -243,24 +310,24 @@ async function analyzeContract(contractAddress, provider) {
     // Fetch ABI
     let abi
     try {
-      abi = await fetchABI(contractAddress)
+      abi = await fetchABI(contractAddress, chain)
     } catch (fetchError) {
       // Distinguish infrastructure/config failures from a genuinely unverified contract
       if (fetchError.code === 'NO_API_KEY') {
-        result.error = 'MintHunter is missing its Etherscan API key (contact the bot admin) - unable to check verification status'
+        result.error = `MintHunter is missing its ${explorerLabel} API key (contact the bot admin) - unable to check verification status`
       } else if (fetchError.code === 'INVALID_API_KEY') {
-        result.error = 'MintHunter\'s Etherscan API key was rejected (contact the bot admin) - unable to check verification status'
+        result.error = `MintHunter's ${explorerLabel} API key was rejected (contact the bot admin) - unable to check verification status`
       } else if (fetchError.code === 'RATE_LIMITED') {
-        result.error = 'Etherscan is rate-limiting requests right now, please try again in a moment'
+        result.error = `${explorerLabel} is rate-limiting requests right now, please try again in a moment`
       } else {
-        result.error = `Could not reach Etherscan to check verification status: ${fetchError.message}`
+        result.error = `Could not reach ${explorerLabel} to check verification status: ${fetchError.message}`
       }
       console.log(`⚠️ ${result.error}`)
       return result
     }
 
     if (!abi) {
-      result.error = 'Contract not verified on Etherscan'
+      result.error = `Contract not verified on ${explorerLabel}`
       console.log('⚠️ Contract not verified; safe auto-mint is unavailable')
       return result
     }

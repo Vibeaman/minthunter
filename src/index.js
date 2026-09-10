@@ -1773,9 +1773,10 @@ initDb().then(async () => {
       }
       
       let analysis
+      const schedChain = state.chain || db.getUserChain(userId)
       try {
-        const provider = await getProvider()
-        analysis = await analyzeContract(state.contract, provider)
+        const provider = await getProvider(schedChain)
+        analysis = await analyzeContract(state.contract, provider, schedChain)
       } catch (error) {
         await bot.sendMessage(chatId, `❌ Could not verify the contract for safe scheduling: ${error.message}. No job was created.`, { reply_markup: mintMenu })
         return
@@ -1866,8 +1867,9 @@ initDb().then(async () => {
       await bot.sendMessage(chatId, '🔍 Analyzing contract...')
       
       try {
-        const provider = await getProvider()
-        const analysis = await analyzeContract(contract, provider)
+        const mintContractChain = state.chain || db.getUserChain(userId)
+        const provider = await getProvider(mintContractChain)
+        const analysis = await analyzeContract(contract, provider, mintContractChain)
         
         state.contractAnalysis = analysis
         
@@ -1889,7 +1891,7 @@ initDb().then(async () => {
           if (analysis.mintFunctions.length > 1) {
             analysisMsg += `\n📋 Found ${analysis.mintFunctions.length} mint functions`
           }
-        } else if (analysis.error && /missing its Etherscan API key|API key was rejected|rate-limiting|Could not reach Etherscan/.test(analysis.error)) {
+        } else if (analysis.error && /missing its .* API key|API key was rejected|is rate-limiting requests|Could not reach .* to check verification status/.test(analysis.error)) {
           // Infrastructure/config issue - not an actual verification failure
           analysisMsg = `⚠️ *Could Not Check Verification*\n\n${analysis.error}`
         } else {
