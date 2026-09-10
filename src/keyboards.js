@@ -9,7 +9,27 @@ const mainMenu = {
     [{ text: '⚡ Mint', callback_data: 'menu_mint' }],
     [{ text: '👛 Wallets', callback_data: 'menu_wallets' }],
     [{ text: '🔥 Trending', callback_data: 'menu_trending' }],
-    [{ text: '⚙️ Settings', callback_data: 'menu_settings' }]
+    [{ text: '⚙️ Settings', callback_data: 'menu_settings' }],
+    [{ text: '❓ How to Use', callback_data: 'menu_help' }]
+  ]
+}
+
+// How to use menu
+const helpMenu = {
+  inline_keyboard: [
+    [{ text: '👛 Wallets', callback_data: 'help_wallets' }],
+    [{ text: '⚡ Minting', callback_data: 'help_mint' }],
+    [{ text: '🔔 Floor Alerts', callback_data: 'help_alerts' }],
+    [{ text: '⚙️ Settings Explained', callback_data: 'help_settings' }],
+    [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
+  ]
+}
+
+// Back to help menu
+const backToHelp = {
+  inline_keyboard: [
+    [{ text: '🔙 Back to How to Use', callback_data: 'menu_help' }],
+    [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
   ]
 }
 
@@ -110,6 +130,8 @@ const backToMain = {
 
 module.exports = {
   mainMenu,
+  helpMenu,
+  backToHelp,
   settingsMenu,
   gasBoostMenu,
   alertsMenu,

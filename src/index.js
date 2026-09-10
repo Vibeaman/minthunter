@@ -8,7 +8,7 @@ const http = require('node:http')
 const { TelegramBotAdapter } = require('./telegram-adapter')
 const { initDb } = require('./db')
 const db = require('./db')
-const { mainMenu, settingsMenu, gasBoostMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
+const { mainMenu, helpMenu, backToHelp, settingsMenu, gasBoostMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
 const { encryptPrivateKey, decryptPrivateKey } = require('./crypto')
 const { getProvider, broadcastToAll, fcfsBroadcast } = require('./provider')
 const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./services/floor')
@@ -256,6 +256,104 @@ initDb().then(async () => {
       return
     }
     
+    // ========== HOW TO USE ==========
+    if (data === 'menu_help') {
+      userState.delete(userId)
+      await bot.editMessageText(
+        `❓ *How to Use MintHunter*\n\n` +
+        `Pick a topic below to see a step-by-step guide.\n\n` +
+        `New here? Start with 👛 Wallets, then ⚡ Minting.`,
+        {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          parse_mode: 'Markdown',
+          reply_markup: helpMenu
+        }
+      )
+      return
+    }
+
+    if (data === 'help_wallets') {
+      await bot.editMessageText(
+        `👛 *How Wallets Work*\n\n` +
+        `1️⃣ Go to *Wallets → Add Wallet*.\n` +
+        `2️⃣ Send the private key of the wallet you want MintHunter to mint from (starts with \`0x\`).\n` +
+        `3️⃣ Your key is encrypted with AES-256 before it's stored — it's never kept in plain text and never shown back to you.\n\n` +
+        `💡 Use a dedicated mint wallet, not your main holdings wallet. Fund it only with what you need for the mint price + gas + the FCFS fee (if used).\n\n` +
+        `📋 *My Wallets* shows the wallets you've added. You'll pick one whenever you create a mint job.`,
+        {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          parse_mode: 'Markdown',
+          reply_markup: backToHelp
+        }
+      )
+      return
+    }
+
+    if (data === 'help_mint') {
+      await bot.editMessageText(
+        `⚡ *How Minting Works*\n\n` +
+        `1️⃣ *Mint → New Mint Job*, then pick the wallet to mint from.\n` +
+        `2️⃣ Send the NFT contract address you want to mint from.\n` +
+        `3️⃣ Choose a mode:\n` +
+        `   • 🐢 *Normal* — mints through your configured RPC at standard speed.\n` +
+        `   • ⚡ *FCFS* — races to broadcast the transaction as fast as possible for competitive mints. This mode charges a small fee (${FCFS_FEE ? FCFS_FEE + ' ETH' : 'set by the bot owner'}), only taken *after* your mint transaction confirms successfully.\n` +
+        `4️⃣ Enter the mint price in ETH (send \`0\` for free mints — MintHunter can usually detect the price automatically).\n` +
+        `5️⃣ Pick a gas level: Normal, Fast (+20%), or Aggressive (+50%). Higher gas = more likely to land first, but costs more.\n\n` +
+        `✅ *Before executing:*\n` +
+        `• Tap 🔍 *Simulate* first to check the transaction will succeed on-chain, without spending anything.\n` +
+        `• When ready, tap 🚀 *EXECUTE NOW* to send the real transaction. This always requires your explicit confirmation — MintHunter never mints automatically without you pressing Execute.\n\n` +
+        `⏰ *Schedule Mint* lets you queue a job to fire automatically at a specific time (e.g. right when a mint opens).\n\n` +
+        `📋 Check *Pending Jobs* for mints waiting to run, and *Completed* for your mint history.`,
+        {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          parse_mode: 'Markdown',
+          reply_markup: backToHelp
+        }
+      )
+      return
+    }
+
+    if (data === 'help_alerts') {
+      await bot.editMessageText(
+        `🔔 *How Floor Alerts Work*\n\n` +
+        `1️⃣ *Floor Alerts → New Alert*.\n` +
+        `2️⃣ Send the NFT collection you want to track.\n` +
+        `3️⃣ Choose a condition:\n` +
+        `   • 📉 *Below* — get notified when the floor price drops below your target.\n` +
+        `   • 📈 *Above* — get notified when it rises above your target.\n` +
+        `4️⃣ Set your target price in ETH.\n\n` +
+        `MintHunter checks floor prices in the background and messages you the moment your condition is met. Manage or remove alerts anytime from 📋 *My Alerts*.\n\n` +
+        `🔥 Tip: check the *Trending* menu on the main screen for collections gaining momentum right now.`,
+        {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          parse_mode: 'Markdown',
+          reply_markup: backToHelp
+        }
+      )
+      return
+    }
+
+    if (data === 'help_settings') {
+      await bot.editMessageText(
+        `⚙️ *Settings Explained*\n\n` +
+        `📉 *Slippage* — when ON, allows a small price tolerance if a mint's actual cost shifts slightly from what was detected.\n\n` +
+        `⛽ *Gas Boost* — a multiplier applied on top of your chosen gas level (2x, 5x, 10x, 20x) to improve your odds in competitive FCFS mints. Higher = faster inclusion, but higher cost.\n\n` +
+        `⏩ *Skip Simulation* — when ON, mint jobs skip the on-chain "dry run" check and go straight to showing the Execute button. Faster, but riskier — you lose the safety check that catches failing transactions before you spend gas. Leave this OFF unless you know what you're doing.\n\n` +
+        `You can change these anytime from ⚙️ *Settings* on the main menu.`,
+        {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          parse_mode: 'Markdown',
+          reply_markup: backToHelp
+        }
+      )
+      return
+    }
+
     // ========== WALLETS MENU ==========
     if (data === 'menu_wallets') {
       userState.delete(userId)
