@@ -23,31 +23,52 @@ const PRICE_PATTERNS = [
 ]
 
 /**
- * Fetch contract ABI from Etherscan
+ * Fetch contract ABI from Etherscan.
+ * Etherscan's v2 API requires a valid API key on every request - there is no
+ * keyless fallback anymore. If the key is missing/invalid, Etherscan replies
+ * with "Missing/Invalid API Key", which must NOT be confused with the
+ * contract genuinely being unverified.
  */
 async function fetchABI(contractAddress) {
+  if (!ETHERSCAN_API_KEY) {
+    const err = new Error('ETHERSCAN_API_KEY is not configured')
+    err.code = 'NO_API_KEY'
+    throw err
+  }
+
   try {
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address=${contractAddress}${ETHERSCAN_API_KEY ? `&apikey=${ETHERSCAN_API_KEY}` : ''}`
-    
+    const url = `https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address=${contractAddress}&apikey=${ETHERSCAN_API_KEY}`
+
     const response = await axios.get(url, { timeout: 10000 })
-    
+
     if (response.data.status === '1' && response.data.result) {
       return JSON.parse(response.data.result)
     }
-    
-    // Try without API key if it failed
-    if (ETHERSCAN_API_KEY) {
-      const fallbackUrl = `https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address=${contractAddress}`
-      const fallback = await axios.get(fallbackUrl, { timeout: 10000 })
-      if (fallback.data.status === '1' && fallback.data.result) {
-        return JSON.parse(fallback.data.result)
-      }
+
+    const resultMsg = typeof response.data.result === 'string' ? response.data.result : ''
+
+    if (/invalid api key/i.test(resultMsg) || /missing.*api key/i.test(resultMsg)) {
+      const err = new Error('Etherscan rejected the configured API key')
+      err.code = 'INVALID_API_KEY'
+      throw err
     }
-    
+
+    if (/rate limit/i.test(resultMsg)) {
+      const err = new Error('Etherscan API rate limit reached, please retry shortly')
+      err.code = 'RATE_LIMITED'
+      throw err
+    }
+
+    // Genuinely unverified/no ABI on record
     return null
   } catch (error) {
+    if (error.code === 'NO_API_KEY' || error.code === 'INVALID_API_KEY' || error.code === 'RATE_LIMITED') {
+      throw error
+    }
     console.error('Etherscan ABI fetch error:', error.message)
-    return null
+    const err = new Error(`Etherscan request failed: ${error.message}`)
+    err.code = 'REQUEST_FAILED'
+    throw err
   }
 }
 
@@ -220,8 +241,24 @@ async function analyzeContract(contractAddress, provider) {
   
   try {
     // Fetch ABI
-    const abi = await fetchABI(contractAddress)
-    
+    let abi
+    try {
+      abi = await fetchABI(contractAddress)
+    } catch (fetchError) {
+      // Distinguish infrastructure/config failures from a genuinely unverified contract
+      if (fetchError.code === 'NO_API_KEY') {
+        result.error = 'MintHunter is missing its Etherscan API key (contact the bot admin) - unable to check verification status'
+      } else if (fetchError.code === 'INVALID_API_KEY') {
+        result.error = 'MintHunter\'s Etherscan API key was rejected (contact the bot admin) - unable to check verification status'
+      } else if (fetchError.code === 'RATE_LIMITED') {
+        result.error = 'Etherscan is rate-limiting requests right now, please try again in a moment'
+      } else {
+        result.error = `Could not reach Etherscan to check verification status: ${fetchError.message}`
+      }
+      console.log(`⚠️ ${result.error}`)
+      return result
+    }
+
     if (!abi) {
       result.error = 'Contract not verified on Etherscan'
       console.log('⚠️ Contract not verified; safe auto-mint is unavailable')

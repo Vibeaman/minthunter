@@ -1785,6 +1785,9 @@ initDb().then(async () => {
           if (analysis.mintFunctions.length > 1) {
             analysisMsg += `\n📋 Found ${analysis.mintFunctions.length} mint functions`
           }
+        } else if (analysis.error && /missing its Etherscan API key|API key was rejected|rate-limiting|Could not reach Etherscan/.test(analysis.error)) {
+          // Infrastructure/config issue - not an actual verification failure
+          analysisMsg = `⚠️ *Could Not Check Verification*\n\n${analysis.error}`
         } else {
           analysisMsg = '❌ *Contract Not Verified*\n\nSafe auto-mint is unavailable for this contract.'
         }
