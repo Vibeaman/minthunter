@@ -8,14 +8,14 @@ const http = require('node:http')
 const { TelegramBotAdapter } = require('./telegram-adapter')
 const { initDb } = require('./db')
 const db = require('./db')
-const { mainMenu, helpMenu, backToHelp, settingsMenu, gasBoostMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain } = require('./keyboards')
+const { mainMenu, helpMenu, backToHelp, settingsMenu, gasBoostMenu, walletsMenu, mintMenu, mintModeMenu, gasOptions, alertsMenu, alertCondition, backToMain, chainSelectorMenu } = require('./keyboards')
 const { encryptPrivateKey, decryptPrivateKey } = require('./crypto')
 const { getProvider, broadcastToAll, fcfsBroadcast } = require('./provider')
 const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./services/floor')
 const { analyzeContract, buildMintData } = require('./services/contract')
 const { ethers } = require('ethers')
 const { calculateTransactionCosts } = require('./transaction-costs')
-const { DEFAULT_CHAIN } = require('./chains')
+const { getChain, isSupportedChain } = require('./chains')
 const {
   isPrivateChat,
   normalizeAccessCode,
@@ -159,6 +159,41 @@ function requirePrivateChat(msg) {
   if (!isPrivateChat(msg)) {
     throw new Error('MintHunter only accepts sensitive commands in a private chat.')
   }
+}
+
+// Renders the settings message text + keyboard from a fresh `users` row.
+// Centralized so the "⛓️ Chain: <current>" row stays consistent everywhere
+// the settings menu is (re)displayed.
+function renderSettingsView(user, { warning = '' } = {}) {
+  const slippageStatus = user?.slippage_enabled ? 'ON' : 'OFF'
+  const slippageEmoji = user?.slippage_enabled ? '✅' : '❌'
+  const gasBoost = user?.gas_boost || 2
+  const skipSimStatus = user?.skip_simulation ? 'ON' : 'OFF'
+  const skipSimEmoji = user?.skip_simulation ? '⚡' : '🔍'
+  const chain = getChain(user?.chain)
+
+  const text =
+    `⚙️ *Settings*${warning}\n\n` +
+    `📉 *Slippage:* ${slippageEmoji} ${slippageStatus}\n` +
+    `⛽ *Gas Boost:* ${gasBoost}x\n` +
+    `⏩ *Skip Simulation:* ${skipSimEmoji} ${skipSimStatus}\n` +
+    `⛓️ *Chain:* ${chain.name}\n\n` +
+    `_Slippage: sends 5% extra ETH._\n` +
+    `_Gas Boost: multiplies gas for speed._\n` +
+    `_Skip Sim: instant mint, no preview._\n` +
+    `_Chain: which network new wallets/mints/alerts use._`
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
+      [{ text: `⛽ Gas Boost: ${gasBoost}x`, callback_data: 'menu_gas_boost' }],
+      [{ text: `⏩ Skip Sim: ${skipSimStatus}`, callback_data: 'toggle_skip_sim' }],
+      [{ text: `⛓️ Chain: ${chain.name}`, callback_data: 'menu_chain' }],
+      [{ text: '🔙 Back', callback_data: 'menu_main' }]
+    ]
+  }
+
+  return { text, keyboard }
 }
 
 // Initialize database then start bot
@@ -370,15 +405,17 @@ initDb().then(async () => {
       return
     }
 
-    // Add wallet - ask for private key
+    // Add wallet - select a chain first, then ask for private key
     if (data === 'wallet_add') {
-      userState.set(userId, { step: 'wallet_key' })
+      const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      userState.set(userId, { step: 'wallet_chain' })
       await bot.sendMessage(chatId,
-        '🔐 *Add Wallet*\n\n' +
-        'Send your private key (starts with 0x).\n\n' +
-        '⚠️ Your key is encrypted with AES-256 and never stored in plain text.\n\n' +
-        '_Send /cancel to abort_',
-        { parse_mode: 'Markdown' }
+        `🔐 *Add Wallet*\n\n` +
+        `Which chain is this wallet for?`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: chainSelectorMenu({ currentChain: user?.chain, backCallbackData: 'menu_wallets' })
+        }
       )
       return
     }
@@ -400,7 +437,7 @@ initDb().then(async () => {
       
       for (const w of wallets) {
         const short = w.address.slice(0, 6) + '...' + w.address.slice(-4)
-        text += `• ${w.label || 'Wallet'}: \`${short}\`\n`
+        text += `• ${w.label || 'Wallet'} (${getChain(w.chain).shortLabel}): \`${short}\`\n`
         buttons.push([{ text: `🗑 Delete ${short}`, callback_data: `wallet_delete_${w.id}` }])
       }
       
@@ -451,7 +488,7 @@ initDb().then(async () => {
       return
     }
 
-    // New mint job - check for wallets first
+    // New mint job - check for wallets first, then pick a chain
     if (data === 'mint_new') {
       const wallets = db.prepare('SELECT * FROM wallets WHERE telegram_id = ?').all(userId)
       
@@ -463,16 +500,14 @@ initDb().then(async () => {
         return
       }
       
-      // Ask to select wallet
-      const buttons = wallets.map(w => {
-        const short = w.address.slice(0, 6) + '...' + w.address.slice(-4)
-        return [{ text: `👛 ${short}`, callback_data: `mint_wallet_${w.id}` }]
-      })
-      buttons.push([{ text: '🔙 Back', callback_data: 'menu_mint' }])
-      
+      const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      userState.set(userId, { step: 'mint_chain' })
       await bot.sendMessage(chatId,
-        '⚡ *New Mint Job*\n\nSelect a wallet to use:',
-        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }
+        '⚡ *New Mint Job*\n\nWhich chain is this mint on?',
+        {
+          parse_mode: 'Markdown',
+          reply_markup: chainSelectorMenu({ currentChain: user?.chain, backCallbackData: 'menu_mint' })
+        }
       )
       return
     }
@@ -491,15 +526,19 @@ initDb().then(async () => {
         return
       }
       
+      const prevState = userState.get(userId) || {}
       userState.set(userId, { 
+        ...prevState,
         step: 'mint_contract', 
         walletId: wallet.id,
         walletAddress: wallet.address
       })
       
       const short = wallet.address.slice(0, 6) + '...' + wallet.address.slice(-4)
+      const chainLine = prevState.chain ? `⛓️ Chain: ${getChain(prevState.chain).name}\n` : ''
       await bot.sendMessage(chatId,
         `⚡ *New Mint Job*\n\n` +
+        chainLine +
         `Wallet: \`${short}\`\n\n` +
         `Send the NFT contract address:`,
         { parse_mode: 'Markdown' }
@@ -558,6 +597,7 @@ initDb().then(async () => {
       
       // Store detected mint function if available
       const mintFunctionJson = state.detectedMintFn ? JSON.stringify(state.detectedMintFn) : null
+      const jobChain = state.chain || db.getUserChain(userId)
       
       const result = db.prepare(`
         INSERT INTO mint_jobs 
@@ -571,7 +611,7 @@ initDb().then(async () => {
         state.mintPrice,
         state.mode,
         Math.floor(250000 * gasMultiplier),
-        DEFAULT_CHAIN // TODO(Phase 3): use the user's selected active chain
+        jobChain
       )
       
       const jobId = result.lastInsertRowid
@@ -597,6 +637,7 @@ initDb().then(async () => {
           `⚠️ *Simulation skipped*\n\n` +
           `📋 Job #${jobId}\n` +
           `📍 Contract: \`${state.contract.slice(0, 10)}...\`\n` +
+          `⛓️ Chain: ${getChain(jobChain).name}\n` +
           `💎 Price: ${state.mintPrice} ETH (~$${mintPriceUsd})\n` +
           `⚡ Mode: ${state.mode.toUpperCase()}\n` +
           `⛽ Gas: ${gasLevel}${feeNote}\n\n` +
@@ -618,6 +659,7 @@ initDb().then(async () => {
           `✅ *Mint Job Created*\n\n` +
           `📋 Job #${jobId}\n` +
           `📍 Contract: \`${state.contract.slice(0, 10)}...\`\n` +
+          `⛓️ Chain: ${getChain(jobChain).name}\n` +
           `💎 Price: ${state.mintPrice} ETH (~$${mintPriceUsd})\n` +
           `⚡ Mode: ${state.mode.toUpperCase()}\n` +
           `⛽ Gas: ${gasLevel}${feeNote}`,
@@ -714,7 +756,7 @@ initDb().then(async () => {
         await bot.sendMessage(chatId,
           `🔍 *Simulation Results*\n\n` +
           `📝 *Contract:* \`${job.contract_address.slice(0,10)}...\`\n` +
-          `⛓ *Chain:* Ethereum\n` +
+          `⛓ *Chain:* ${getChain(job.chain).name}\n` +
           `⚡ *Mode:* ${job.mint_mode.toUpperCase()}\n\n` +
           `━━━━━━━━━━━━━━━\n\n` +
           `💰 *Mint Price:* ${mintEth} ETH (~$${mintUsd})\n` +
@@ -990,18 +1032,14 @@ initDb().then(async () => {
         return
       }
       
-      const buttons = wallets.map(w => {
-        const short = w.address.slice(0, 6) + '...' + w.address.slice(-4)
-        return [{ text: `👛 ${short}`, callback_data: `sched_wallet_${w.id}` }]
-      })
-      buttons.push([{ text: '🔙 Back', callback_data: 'menu_mint' }])
-      
+      const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      userState.set(userId, { step: 'sched_chain' })
       await bot.sendMessage(chatId,
-        '⏰ *Schedule FCFS Mint*\n\n' +
-        'Bot will auto-mint at your scheduled time.\n' +
-        '⚡ Uses aggressive gas + multi-RPC broadcast for max speed.\n\n' +
-        'Select wallet:',
-        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }
+        '⏰ *Schedule FCFS Mint*\n\nWhich chain is this mint on?',
+        {
+          parse_mode: 'Markdown',
+          reply_markup: chainSelectorMenu({ currentChain: user?.chain, backCallbackData: 'menu_mint' })
+        }
       )
       return
     }
@@ -1020,15 +1058,19 @@ initDb().then(async () => {
         return
       }
       
+      const prevState = userState.get(userId) || {}
       userState.set(userId, {
+        ...prevState,
         step: 'sched_contract',
         walletId: wallet.id,
         walletAddress: wallet.address,
         isScheduled: true
       })
       
+      const chainLine = prevState.chain ? `⛓️ Chain: ${getChain(prevState.chain).name}\n\n` : ''
       await bot.sendMessage(chatId,
         '⏰ *Schedule FCFS Mint*\n\n' +
+        chainLine +
         'Send the NFT contract address:',
         { parse_mode: 'Markdown' }
       )
@@ -1052,7 +1094,7 @@ initDb().then(async () => {
       const buttons = []
       
       for (const job of jobs) {
-        text += `#${job.id} - \`${job.contract_address.slice(0, 10)}...\` (${job.mint_mode})\n`
+        text += `#${job.id} - \`${job.contract_address.slice(0, 10)}...\` (${job.mint_mode}, ${getChain(job.chain).shortLabel})\n`
         buttons.push([
           { text: `🔍 Simulate #${job.id}`, callback_data: `mint_simulate_${job.id}` },
           { text: `❌ Cancel`, callback_data: `mint_cancel_${job.id}` }
@@ -1086,7 +1128,7 @@ initDb().then(async () => {
       
       for (const job of jobs) {
         const status = job.status === 'completed' ? '✅' : job.status === 'failed' ? '❌' : '🚫'
-        text += `${status} #${job.id} - \`${job.contract_address.slice(0, 10)}...\`\n`
+        text += `${status} #${job.id} - \`${job.contract_address.slice(0, 10)}...\` (${getChain(job.chain).shortLabel})\n`
         if (job.tx_hash) {
           text += `   TX: \`${job.tx_hash.slice(0, 15)}...\`\n`
         }
@@ -1118,15 +1160,16 @@ initDb().then(async () => {
       return
     }
 
-    // New alert - ask for collection address
+    // New alert - select a chain first, then ask for collection address
     if (data === 'alert_new') {
-      userState.set(userId, { step: 'alert_collection' })
+      const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      userState.set(userId, { step: 'alert_chain' })
       await bot.sendMessage(chatId,
-        '🔔 *New Floor Alert*\n\n' +
-        'Send the NFT collection contract address:\n\n' +
-        '_Example: 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d (BAYC)_\n\n' +
-        '_Send /cancel to abort_',
-        { parse_mode: 'Markdown' }
+        '🔔 *New Floor Alert*\n\nWhich chain is this collection on?',
+        {
+          parse_mode: 'Markdown',
+          reply_markup: chainSelectorMenu({ currentChain: user?.chain, backCallbackData: 'menu_alerts' })
+        }
       )
       return
     }
@@ -1140,6 +1183,7 @@ initDb().then(async () => {
       }
       
       const condition = data.replace('condition_', '') // 'above' or 'below'
+      const alertChain = state.chain || db.getUserChain(userId)
       
       // Create the alert
       const result = db.prepare(`
@@ -1152,7 +1196,7 @@ initDb().then(async () => {
         state.collectionName || 'Unknown',
         state.alertPrice,
         condition,
-        DEFAULT_CHAIN // TODO(Phase 3): use the user's selected active chain
+        alertChain
       )
       
       const alertId = result.lastInsertRowid
@@ -1165,6 +1209,7 @@ initDb().then(async () => {
         `✅ *Alert Created*\n\n` +
         `📋 Alert #${alertId}\n` +
         `📍 Collection: \`${state.collection.slice(0, 10)}...\`\n` +
+        `⛓️ Chain: ${getChain(alertChain).name}\n` +
         `${symbol} Trigger: ${condition} ${state.alertPrice} ETH\n\n` +
         `You'll be notified when the floor price goes ${condition} ${state.alertPrice} ETH.`,
         { parse_mode: 'Markdown', reply_markup: alertsMenu }
@@ -1194,7 +1239,7 @@ initDb().then(async () => {
       for (const alert of alerts) {
         const symbol = alert.condition === 'below' ? '📉' : '📈'
         const short = alert.collection_address.slice(0, 8) + '...'
-        text += `#${alert.id} - \`${short}\`\n`
+        text += `#${alert.id} - \`${short}\` (${getChain(alert.chain).shortLabel})\n`
         text += `   ${symbol} ${alert.condition} ${alert.target_price} ETH\n\n`
         buttons.push([{ text: `🗑 Delete #${alert.id}`, callback_data: `alert_delete_${alert.id}` }])
       }
@@ -1223,32 +1268,132 @@ initDb().then(async () => {
     // ========== SETTINGS MENU ==========
     if (data === 'menu_settings') {
       const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
-      const slippageStatus = user?.slippage_enabled ? 'ON' : 'OFF'
-      const slippageEmoji = user?.slippage_enabled ? '✅' : '❌'
-      const gasBoost = user?.gas_boost || 2
-      const skipSimStatus = user?.skip_simulation ? 'ON' : 'OFF'
-      const skipSimEmoji = user?.skip_simulation ? '⚡' : '🔍'
-      
+      const { text, keyboard } = renderSettingsView(user)
+      await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard })
+      return
+    }
+
+    // Chain selector (from Settings)
+    if (data === 'menu_chain') {
+      const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+      userState.set(userId, { step: 'settings_chain' })
       await bot.sendMessage(chatId,
-        `⚙️ *Settings*\n\n` +
-        `📉 *Slippage:* ${slippageEmoji} ${slippageStatus}\n` +
-        `⛽ *Gas Boost:* ${gasBoost}x\n` +
-        `⏩ *Skip Simulation:* ${skipSimEmoji} ${skipSimStatus}\n\n` +
-        `_Slippage: sends 5% extra ETH._\n` +
-        `_Gas Boost: multiplies gas for speed._\n` +
-        `_Skip Sim: instant mint, no preview._`,
+        `⛓️ *Select Active Chain*\n\n` +
+        `This is the default chain used for new wallets, mint jobs, and floor alerts.\n\n` +
+        `Current: *${getChain(user?.chain).name}*`,
         {
           parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
-              [{ text: `⛽ Gas Boost: ${gasBoost}x`, callback_data: 'menu_gas_boost' }],
-              [{ text: `⏩ Skip Sim: ${skipSimStatus}`, callback_data: 'toggle_skip_sim' }],
-              [{ text: '🔙 Back', callback_data: 'menu_main' }]
-            ]
-          }
+          reply_markup: chainSelectorMenu({ currentChain: user?.chain, backCallbackData: 'menu_settings' })
         }
       )
+      return
+    }
+
+    // Chain selection made (either from Settings, or as part of a flow below)
+    if (data.startsWith('chain_select_')) {
+      const chainKey = data.replace('chain_select_', '')
+      if (!isSupportedChain(chainKey)) {
+        await bot.sendMessage(chatId, '❌ Unsupported chain.', { reply_markup: mainMenu })
+        return
+      }
+      const chain = getChain(chainKey)
+      const state = userState.get(userId)
+
+      // Settings: just update the user's active chain preference
+      if (state?.step === 'settings_chain') {
+        db.setUserChain(userId, chain.id)
+        userState.delete(userId)
+        const updatedUser = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
+        const { text, keyboard } = renderSettingsView(updatedUser, { warning: `\n\n✅ Active chain set to *${chain.name}*` })
+        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard })
+        return
+      }
+
+      // wallet_add flow: chain chosen, now ask for the private key
+      if (state?.step === 'wallet_chain') {
+        db.setUserChain(userId, chain.id)
+        userState.set(userId, { ...state, chain: chain.id, step: 'wallet_key' })
+        await bot.sendMessage(chatId,
+          `🔐 *Add Wallet*\n\n` +
+          `⛓️ Chain: *${chain.name}*\n\n` +
+          'Send your private key (starts with 0x).\n\n' +
+          '⚠️ Your key is encrypted with AES-256 and never stored in plain text.\n\n' +
+          '_Send /cancel to abort_',
+          { parse_mode: 'Markdown' }
+        )
+        return
+      }
+
+      // mint_new flow: chain chosen, now ask which wallet to use
+      if (state?.step === 'mint_chain') {
+        const wallets = db.prepare('SELECT * FROM wallets WHERE telegram_id = ?').all(userId)
+        if (wallets.length === 0) {
+          userState.delete(userId)
+          await bot.sendMessage(chatId,
+            '❌ No wallets found.\n\nAdd a wallet first before creating mint jobs.',
+            { reply_markup: walletsMenu }
+          )
+          return
+        }
+        db.setUserChain(userId, chain.id)
+        userState.set(userId, { ...state, chain: chain.id, step: 'mint_wallet_select' })
+        const buttons = wallets.map(w => {
+          const short = w.address.slice(0, 6) + '...' + w.address.slice(-4)
+          return [{ text: `👛 ${short}`, callback_data: `mint_wallet_${w.id}` }]
+        })
+        buttons.push([{ text: '🔙 Back', callback_data: 'menu_mint' }])
+        await bot.sendMessage(chatId,
+          `⚡ *New Mint Job*\n\n⛓️ Chain: *${chain.name}*\n\nSelect a wallet to use:`,
+          { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }
+        )
+        return
+      }
+
+      // Scheduled mint flow: chain chosen, now ask which wallet to use
+      if (state?.step === 'sched_chain') {
+        const wallets = db.prepare('SELECT * FROM wallets WHERE telegram_id = ?').all(userId)
+        if (wallets.length === 0) {
+          userState.delete(userId)
+          await bot.sendMessage(chatId,
+            '❌ No wallets found.\n\nAdd a wallet first.',
+            { reply_markup: walletsMenu }
+          )
+          return
+        }
+        db.setUserChain(userId, chain.id)
+        userState.set(userId, { ...state, chain: chain.id, step: 'sched_wallet_select' })
+        const buttons = wallets.map(w => {
+          const short = w.address.slice(0, 6) + '...' + w.address.slice(-4)
+          return [{ text: `👛 ${short}`, callback_data: `sched_wallet_${w.id}` }]
+        })
+        buttons.push([{ text: '🔙 Back', callback_data: 'menu_mint' }])
+        await bot.sendMessage(chatId,
+          `⏰ *Schedule FCFS Mint*\n\n` +
+          `⛓️ Chain: *${chain.name}*\n\n` +
+          'Bot will auto-mint at your scheduled time.\n' +
+          '⚡ Uses aggressive gas + multi-RPC broadcast for max speed.\n\n' +
+          'Select wallet:',
+          { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }
+        )
+        return
+      }
+
+      // alert_new flow: chain chosen, now ask for the collection address
+      if (state?.step === 'alert_chain') {
+        db.setUserChain(userId, chain.id)
+        userState.set(userId, { ...state, chain: chain.id, step: 'alert_collection' })
+        await bot.sendMessage(chatId,
+          `🔔 *New Floor Alert*\n\n` +
+          `⛓️ Chain: *${chain.name}*\n\n` +
+          'Send the NFT collection contract address:\n\n' +
+          '_Example: 0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d (BAYC)_\n\n' +
+          '_Send /cancel to abort_',
+          { parse_mode: 'Markdown' }
+        )
+        return
+      }
+
+      await bot.sendMessage(chatId, '❌ Session expired. Please start over from the menu.', { reply_markup: mainMenu })
       return
     }
 
@@ -1307,32 +1452,8 @@ initDb().then(async () => {
       
       // Refresh settings menu
       const updatedUser = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
-      const slippageStatus = updatedUser?.slippage_enabled ? 'ON' : 'OFF'
-      const slippageEmoji = updatedUser?.slippage_enabled ? '✅' : '❌'
-      const gasBoost = updatedUser?.gas_boost || 2
-      const skipSimStatus = updatedUser?.skip_simulation ? 'ON' : 'OFF'
-      const skipSimEmoji = updatedUser?.skip_simulation ? '⚡' : '🔍'
-      
-      await bot.sendMessage(chatId,
-        `⚙️ *Settings*\n\n` +
-        `📉 *Slippage:* ${slippageEmoji} ${slippageStatus}\n` +
-        `⛽ *Gas Boost:* ${gasBoost}x\n` +
-        `⏩ *Skip Simulation:* ${skipSimEmoji} ${skipSimStatus}\n\n` +
-        `_Slippage: sends 5% extra ETH._\n` +
-        `_Gas Boost: multiplies gas for speed._\n` +
-        `_Skip Sim: instant mint, no preview._`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
-              [{ text: `⛽ Gas Boost: ${gasBoost}x`, callback_data: 'menu_gas_boost' }],
-              [{ text: `⏩ Skip Sim: ${skipSimStatus}`, callback_data: 'toggle_skip_sim' }],
-              [{ text: '🔙 Back', callback_data: 'menu_main' }]
-            ]
-          }
-        }
-      )
+      const { text, keyboard } = renderSettingsView(updatedUser)
+      await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard })
       return
     }
 
@@ -1345,34 +1466,9 @@ initDb().then(async () => {
       
       // Refresh settings menu
       const updatedUser = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(userId)
-      const slippageStatus = updatedUser?.slippage_enabled ? 'ON' : 'OFF'
-      const slippageEmoji = updatedUser?.slippage_enabled ? '✅' : '❌'
-      const gasBoost = updatedUser?.gas_boost || 2
-      const skipSimStatus = updatedUser?.skip_simulation ? 'ON' : 'OFF'
-      const skipSimEmoji = updatedUser?.skip_simulation ? '⚡' : '🔍'
-      
       const warning = newValue ? '\n\n⚠️ *YOLO MODE ENABLED*\nMints will execute instantly without preview!' : ''
-      
-      await bot.sendMessage(chatId,
-        `⚙️ *Settings*${warning}\n\n` +
-        `📉 *Slippage:* ${slippageEmoji} ${slippageStatus}\n` +
-        `⛽ *Gas Boost:* ${gasBoost}x\n` +
-        `⏩ *Skip Simulation:* ${skipSimEmoji} ${skipSimStatus}\n\n` +
-        `_Slippage: sends 5% extra ETH._\n` +
-        `_Gas Boost: multiplies gas for speed._\n` +
-        `_Skip Sim: instant mint, no preview._`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: `📉 Slippage: ${slippageStatus}`, callback_data: 'toggle_slippage' }],
-              [{ text: `⛽ Gas Boost: ${gasBoost}x`, callback_data: 'menu_gas_boost' }],
-              [{ text: `⏩ Skip Sim: ${skipSimStatus}`, callback_data: 'toggle_skip_sim' }],
-              [{ text: '🔙 Back', callback_data: 'menu_main' }]
-            ]
-          }
-        }
-      )
+      const { text, keyboard } = renderSettingsView(updatedUser, { warning })
+      await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard })
       return
     }
 
@@ -1691,6 +1787,7 @@ initDb().then(async () => {
       }
 
       // Create a scheduled FCFS job with the verified ABI function attached.
+      const jobChain = state.chain || db.getUserChain(userId)
       const result = db.prepare(`
         INSERT INTO mint_jobs
         (telegram_id, wallet_id, contract_address, mint_function, mint_price, mint_mode, gas_limit, status, scheduled_at, chain)
@@ -1703,7 +1800,7 @@ initDb().then(async () => {
         state.mintPrice,
         375000,
         scheduledDate.toISOString(),
-        DEFAULT_CHAIN // TODO(Phase 3): use the user's selected active chain
+        jobChain
       )
       
       const jobId = result.lastInsertRowid
@@ -1729,6 +1826,7 @@ initDb().then(async () => {
         `✅ *Scheduled Mint Created*\n\n` +
         `📋 Job #${jobId}\n` +
         `📍 Contract: \`${state.contract.slice(0, 10)}...\`\n` +
+        `⛓️ Chain: ${getChain(jobChain).name}\n` +
         `💎 Price: ${state.mintPrice} ETH (~$${priceUsd})\n` +
         `⏰ Time: ${displayTime}\n` +
         `⏱ In: ${timeUntil}\n\n` +
@@ -1869,10 +1967,11 @@ initDb().then(async () => {
         
         // Encrypt and store
         const encrypted = encryptPrivateKey(key, userId.toString())
+        const walletChain = state.chain || db.getUserChain(userId)
         try {
           db.prepare(
             'INSERT INTO wallets (telegram_id, address, encrypted_key, label, chain) VALUES (?, ?, ?, ?, ?)'
-          ).run(userId, address, encrypted, 'Wallet', DEFAULT_CHAIN) // TODO(Phase 3): use the user's selected active chain
+          ).run(userId, address, encrypted, 'Wallet', walletChain)
         } catch (insertError) {
           if (String(insertError.message).toLowerCase().includes('unique')) {
             await bot.sendMessage(chatId, '❌ That wallet is already added.', { reply_markup: walletsMenu })
@@ -1893,7 +1992,8 @@ initDb().then(async () => {
         const short = address.slice(0, 6) + '...' + address.slice(-4)
         await bot.sendMessage(chatId,
           `✅ *Wallet Added*\n\n` +
-          `Address: \`${short}\`\n\n` +
+          `Address: \`${short}\`\n` +
+          `⛓️ Chain: ${getChain(walletChain).name}\n\n` +
           `Your key is encrypted and secure.`,
           { parse_mode: 'Markdown', reply_markup: walletsMenu }
         )

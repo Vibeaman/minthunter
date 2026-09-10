@@ -2,6 +2,21 @@
  * Telegram inline keyboard layouts
  */
 
+const { listChains } = require('./chains')
+
+// Chain selector - built dynamically from src/chains.js so any chain added
+// there is automatically offered here, with no hardcoded chain names.
+// `currentChain` (a chain id) gets a checkmark to show the active preference.
+// `backCallbackData` controls where the "Back" button returns to.
+function chainSelectorMenu({ currentChain, backCallbackData = 'menu_main' } = {}) {
+  const buttons = listChains().map((chain) => {
+    const marker = chain.id === currentChain ? '✅' : '⛓️'
+    return [{ text: `${marker} ${chain.name}`, callback_data: `chain_select_${chain.id}` }]
+  })
+  buttons.push([{ text: '🔙 Back', callback_data: backCallbackData }])
+  return { inline_keyboard: buttons }
+}
+
 // Main menu
 const mainMenu = {
   inline_keyboard: [
@@ -141,5 +156,6 @@ module.exports = {
   gasOptions,
   alertCondition,
   confirmCancel,
-  backToMain
+  backToMain,
+  chainSelectorMenu
 }

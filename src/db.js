@@ -6,7 +6,7 @@
 const initSqlJs = require('sql.js')
 const fs = require('fs')
 const path = require('path')
-const { DEFAULT_CHAIN } = require('./chains')
+const { DEFAULT_CHAIN, getChain } = require('./chains')
 
 function resolveDbPath(env = process.env) {
   const directory = env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, '..')
@@ -203,6 +203,16 @@ async function initDb() {
     // Column already exists
   }
 
+  // Chain Selection UI (Phase 3): every user has an active/preferred chain
+  // from src/chains.js, used to default new wallets/mints/alerts and shown
+  // across the bot's menus. Existing users predate chain selection, so they
+  // migrate to the chains.js default.
+  try {
+    db.run(`ALTER TABLE users ADD COLUMN chain TEXT NOT NULL DEFAULT '${DEFAULT_CHAIN}'`)
+  } catch (e) {
+    // Column already exists
+  }
+
   // Multi-chain support (Phase 2): every wallet, alert, and mint job belongs
   // to a chain from src/chains.js. Existing rows predate chain selection, so
   // they migrate to 'ethereum' - MintHunter's only chain before this change.
@@ -317,9 +327,28 @@ const dbWrapper = {
   }
 }
 
+// Chain Selection UI (Phase 3) helpers -------------------------------------
+
+// Returns the user's active/preferred chain (chains.js's DEFAULT_CHAIN if the
+// user doesn't exist yet or hasn't picked one).
+function getUserChain(telegramId) {
+  const user = dbWrapper.prepare('SELECT chain FROM users WHERE telegram_id = ?').get(telegramId)
+  return user?.chain || DEFAULT_CHAIN
+}
+
+// Persists the user's active/preferred chain. Throws if the chain isn't one
+// defined in src/chains.js, so callers never write an unsupported value.
+function setUserChain(telegramId, chain) {
+  const validated = getChain(chain).id
+  dbWrapper.prepare('UPDATE users SET chain = ? WHERE telegram_id = ?').run(validated, telegramId)
+  return validated
+}
+
 module.exports = dbWrapper
 module.exports.initDb = initDb
 module.exports.save = save
 module.exports.resolveDbPath = resolveDbPath
 module.exports.refreshFromDiskIfChanged = refreshFromDiskIfChanged
 module.exports.reconcileInterruptedAccessCodeClaims = reconcileInterruptedAccessCodeClaims
+module.exports.getUserChain = getUserChain
+module.exports.setUserChain = setUserChain
