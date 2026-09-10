@@ -1,38 +1,44 @@
 /**
- * Ethereum mainnet provider and broadcast helpers.
- * Only explicitly configured RPC endpoints are used.
+ * Chain-aware provider and broadcast helpers.
+ * Only explicitly configured RPC endpoints are used - MintHunter never
+ * silently falls back to a public/unverified RPC for reads or broadcasts.
  */
 
 const path = require('path')
 const { ethers } = require('ethers')
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') })
+const { getChain, DEFAULT_CHAIN } = require('./chains')
 
-const configuredRpcs = [
-  process.env.ALCHEMY_RPC,
-  process.env.INFURA_RPC,
-  process.env.QUICKNODE_RPC,
-  ...(process.env.BROADCAST_RPCS || '').split(',').map((url) => url.trim()).filter(Boolean),
-].filter(Boolean)
-
-const RPC_ENDPOINTS = [...new Set(configuredRpcs)]
 const CACHE_TTL = 60_000
 const RPC_TIMEOUT = 8_000
-const providerCache = new Map()
-let cachedProvider = null
-let cacheTime = 0
-let lastBlockTime = 0
-let avgBlockInterval = 12_000
-const blockTimeSamples = []
 
-function getConfiguredEndpoints() {
-  if (RPC_ENDPOINTS.length === 0) {
-    throw new Error('Configure ALCHEMY_RPC, INFURA_RPC, QUICKNODE_RPC, or BROADCAST_RPCS')
+const providerCache = new Map() // rpc url -> ethers provider
+const chainProviderCache = new Map() // chain id -> { provider, cacheTime }
+const chainBlockTiming = new Map() // chain id -> { lastBlockTime, avgBlockInterval, samples }
+
+function getConfiguredEndpoints(chainKey = DEFAULT_CHAIN) {
+  const chain = getChain(chainKey)
+
+  const fromEnvKeys = chain.rpcEnvKeys
+    .map((key) => process.env[key])
+    .filter(Boolean)
+
+  const fromBroadcastList = chain.broadcastRpcsEnvKey
+    ? (process.env[chain.broadcastRpcsEnvKey] || '').split(',').map((url) => url.trim()).filter(Boolean)
+    : []
+
+  const endpoints = [...new Set([...fromEnvKeys, ...fromBroadcastList])]
+
+  if (endpoints.length === 0) {
+    const envHint = [...chain.rpcEnvKeys, chain.broadcastRpcsEnvKey].filter(Boolean).join(', ')
+    throw new Error(`Configure at least one RPC endpoint for ${chain.name} (${envHint})`)
   }
-  return RPC_ENDPOINTS
+
+  return endpoints
 }
 
 function createProvider(url) {
-  // Do not use staticNetwork here: the endpoint itself must prove it serves mainnet.
+  // Do not use staticNetwork here: the endpoint itself must prove which chain it serves.
   return new ethers.JsonRpcProvider(url)
 }
 
@@ -55,36 +61,44 @@ async function withTimeout(promise, timeout = RPC_TIMEOUT) {
   }
 }
 
-async function assertMainnet(provider) {
+/**
+ * Confirm a provider actually serves the expected chain ID. Replaces the old
+ * Ethereum-only assertMainnet() so every chain gets the same protection.
+ */
+async function assertChain(provider, expectedChainId) {
   const network = await withTimeout(provider.getNetwork())
-  if (network.chainId !== 1n) throw new Error('Configured RPC is not Ethereum mainnet')
+  const expected = BigInt(expectedChainId)
+  if (network.chainId !== expected) {
+    throw new Error(`Configured RPC is not chain ${expected} (got ${network.chainId})`)
+  }
   return provider
 }
 
-async function getProvider() {
-  if (cachedProvider && Date.now() - cacheTime < CACHE_TTL) return cachedProvider
+async function getProvider(chainKey = DEFAULT_CHAIN) {
+  const chain = getChain(chainKey)
+  const cached = chainProviderCache.get(chain.id)
+  if (cached && Date.now() - cached.cacheTime < CACHE_TTL) return cached.provider
 
-  const attempts = getConfiguredEndpoints().map(async (url) => {
+  const attempts = getConfiguredEndpoints(chain.id).map(async (url) => {
     const provider = getOrCreateProvider(url)
     const block = await withTimeout(provider.getBlockNumber())
-    await assertMainnet(provider)
+    await assertChain(provider, chain.chainId)
     return { provider, block, url }
   })
 
   try {
     const winner = await Promise.any(attempts)
-    console.log(`✅ Using configured Ethereum RPC (block ${winner.block})`)
-    cachedProvider = winner.provider
-    cacheTime = Date.now()
+    console.log(`✅ Using configured ${chain.name} RPC (block ${winner.block})`)
+    chainProviderCache.set(chain.id, { provider: winner.provider, cacheTime: Date.now() })
     return winner.provider
   } catch (error) {
     const reasons = error.errors?.map((reason) => reason?.message || 'unknown RPC error').join('; ')
-    throw new Error(`All configured Ethereum RPC endpoints failed${reasons ? `: ${reasons}` : ''}`)
+    throw new Error(`All configured ${chain.name} RPC endpoints failed${reasons ? `: ${reasons}` : ''}`)
   }
 }
 
-function createAllProviders() {
-  return getConfiguredEndpoints().map(getOrCreateProvider)
+function createAllProviders(chainKey = DEFAULT_CHAIN) {
+  return getConfiguredEndpoints(chainKey).map(getOrCreateProvider)
 }
 
 async function firstSuccessfulBroadcast(providers, signedTx, label) {
@@ -102,31 +116,48 @@ async function firstSuccessfulBroadcast(providers, signedTx, label) {
   }
 }
 
-async function broadcastToAll(signedTx) {
-  return firstSuccessfulBroadcast(createAllProviders(), signedTx, 'Broadcast')
+async function broadcastToAll(signedTx, chainKey = DEFAULT_CHAIN) {
+  return firstSuccessfulBroadcast(createAllProviders(chainKey), signedTx, 'Broadcast')
 }
 
-async function sendViaFlashbots(signedTx) {
-  if (!process.env.FLASHBOTS_RPC) return broadcastToAll(signedTx)
+async function sendViaFlashbots(signedTx, chainKey = DEFAULT_CHAIN) {
+  const chain = getChain(chainKey)
+  const flashbotsUrl = chain.flashbotsRpcEnvKey ? process.env[chain.flashbotsRpcEnvKey] : null
+
+  if (!flashbotsUrl) return broadcastToAll(signedTx, chainKey)
+
   try {
-    const provider = await assertMainnet(getOrCreateProvider(process.env.FLASHBOTS_RPC))
+    const provider = await assertChain(getOrCreateProvider(flashbotsUrl), chain.chainId)
     return await withTimeout(provider.broadcastTransaction(signedTx))
   } catch (error) {
     console.error(`⚠️ Configured Flashbots RPC failed: ${error.message}`)
-    return broadcastToAll(signedTx)
+    return broadcastToAll(signedTx, chainKey)
   }
 }
 
-async function updateBlockTiming(provider) {
+function getBlockTimingState(chainKey) {
+  const chain = getChain(chainKey)
+  if (!chainBlockTiming.has(chain.id)) {
+    chainBlockTiming.set(chain.id, {
+      lastBlockTime: 0,
+      avgBlockInterval: chain.approxBlockTimeMs,
+      samples: [],
+    })
+  }
+  return chainBlockTiming.get(chain.id)
+}
+
+async function updateBlockTiming(provider, chainKey = DEFAULT_CHAIN) {
+  const state = getBlockTimingState(chainKey)
   try {
     const block = await withTimeout(provider.getBlock('latest'))
     const now = Number(block.timestamp) * 1000
-    if (lastBlockTime > 0 && now > lastBlockTime) {
-      blockTimeSamples.push(now - lastBlockTime)
-      if (blockTimeSamples.length > 10) blockTimeSamples.shift()
-      avgBlockInterval = blockTimeSamples.reduce((sum, value) => sum + value, 0) / blockTimeSamples.length
+    if (state.lastBlockTime > 0 && now > state.lastBlockTime) {
+      state.samples.push(now - state.lastBlockTime)
+      if (state.samples.length > 10) state.samples.shift()
+      state.avgBlockInterval = state.samples.reduce((sum, value) => sum + value, 0) / state.samples.length
     }
-    lastBlockTime = now
+    state.lastBlockTime = now
     return block
   } catch (error) {
     console.error(`⚠️ Block timing update failed: ${error.message}`)
@@ -134,39 +165,42 @@ async function updateBlockTiming(provider) {
   }
 }
 
-async function waitForOptimalTiming(provider) {
-  const block = await updateBlockTiming(provider)
+async function waitForOptimalTiming(provider, chainKey = DEFAULT_CHAIN) {
+  const block = await updateBlockTiming(provider, chainKey)
   if (!block) return
+  const state = getBlockTimingState(chainKey)
   const blockAge = Date.now() - Number(block.timestamp) * 1000
-  const timeToNextBlock = avgBlockInterval - blockAge
+  const timeToNextBlock = state.avgBlockInterval - blockAge
   if (timeToNextBlock > 1_000 && timeToNextBlock < 3_000) {
     await new Promise((resolve) => setTimeout(resolve, Math.max(0, timeToNextBlock - 500)))
   }
 }
 
-async function fcfsBroadcast(signedTx, useBlockTiming = false) {
-  const endpoints = process.env.FLASHBOTS_RPC
-    ? [process.env.FLASHBOTS_RPC, ...getConfiguredEndpoints()]
-    : getConfiguredEndpoints()
+async function fcfsBroadcast(signedTx, chainKey = DEFAULT_CHAIN, useBlockTiming = false) {
+  const chain = getChain(chainKey)
+  const flashbotsUrl = chain.flashbotsRpcEnvKey ? process.env[chain.flashbotsRpcEnvKey] : null
+  const endpoints = flashbotsUrl
+    ? [flashbotsUrl, ...getConfiguredEndpoints(chainKey)]
+    : getConfiguredEndpoints(chainKey)
   const uniqueEndpoints = [...new Set(endpoints)]
   const providers = uniqueEndpoints.map(getOrCreateProvider)
 
   // Disabled by default because waiting for a block edge is slower than immediate
   // propagation. It remains opt-in for controlled experiments.
-  if (useBlockTiming && providers.length > 0) await waitForOptimalTiming(providers[0])
+  if (useBlockTiming && providers.length > 0) await waitForOptimalTiming(providers[0], chainKey)
 
   return firstSuccessfulBroadcast(providers, signedTx, 'FCFS broadcast')
 }
 
 function clearCache() {
-  cachedProvider = null
-  cacheTime = 0
+  chainProviderCache.clear()
   providerCache.clear()
+  chainBlockTiming.clear()
 }
 
 module.exports = {
-  RPC_ENDPOINTS,
-  assertMainnet,
+  getConfiguredEndpoints,
+  assertChain,
   broadcastToAll,
   clearCache,
   createAllProviders,
