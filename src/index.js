@@ -1678,11 +1678,12 @@ initDb().then(async () => {
         const provider = await getProvider()
         analysis = await analyzeContract(state.contract, provider)
       } catch (error) {
-        await bot.sendMessage(chatId, '❌ Could not verify the contract for safe scheduling. No job was created.', { reply_markup: mintMenu })
+        await bot.sendMessage(chatId, `❌ Could not verify the contract for safe scheduling: ${error.message}. No job was created.`, { reply_markup: mintMenu })
         return
       }
       if (!analysis.verified || !analysis.recommendedMint) {
-        await bot.sendMessage(chatId, '❌ This contract has no verified, supported mint function. No job was created.', { reply_markup: mintMenu })
+        const reason = analysis.error || 'This contract has no verified, supported mint function.'
+        await bot.sendMessage(chatId, `❌ ${reason}. No job was created.`, { reply_markup: mintMenu })
         return
       }
 
