@@ -38,7 +38,12 @@ function isPrivateChat(msg) {
 }
 
 function validatePrivateKey(value) {
-  const key = String(value ?? '').trim()
+  let key = String(value ?? '').trim()
+  // Be forgiving of a missing "0x" prefix - a bare 64-hex-character key is
+  // unambiguous and people commonly copy private keys without the prefix.
+  if (/^[0-9a-fA-F]{64}$/.test(key)) {
+    key = `0x${key}`
+  }
   if (!/^0x[0-9a-fA-F]{64}$/.test(key)) return null
   try {
     return new ethers.Wallet(key)
