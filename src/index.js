@@ -1205,13 +1205,14 @@ initDb().then(async () => {
       userState.delete(userId)
       
       const symbol = condition === 'below' ? '📉' : '📈'
+      const alertNativeSymbol = getChain(alertChain).nativeSymbol
       await bot.sendMessage(chatId,
         `✅ *Alert Created*\n\n` +
         `📋 Alert #${alertId}\n` +
         `📍 Collection: \`${state.collection.slice(0, 10)}...\`\n` +
         `⛓️ Chain: ${getChain(alertChain).name}\n` +
-        `${symbol} Trigger: ${condition} ${state.alertPrice} ETH\n\n` +
-        `You'll be notified when the floor price goes ${condition} ${state.alertPrice} ETH.`,
+        `${symbol} Trigger: ${condition} ${state.alertPrice} ${alertNativeSymbol}\n\n` +
+        `You'll be notified when the floor price goes ${condition} ${state.alertPrice} ${alertNativeSymbol}.`,
         { parse_mode: 'Markdown', reply_markup: alertsMenu }
       )
       return
@@ -1474,20 +1475,23 @@ initDb().then(async () => {
 
     // ========== TRENDING MENU ==========
     if (data === 'menu_trending') {
-      await bot.sendMessage(chatId, '🔥 Fetching trending collections...')
+      const trendingChain = getChain(db.getUserChain(userId))
+      await bot.sendMessage(chatId, `🔥 Fetching trending collections on ${trendingChain.name}...`)
       
       try {
-        const trending = await getTrending()
+        const trending = await getTrending(trendingChain.id)
         
         if (!trending || trending.length === 0) {
-          await bot.sendMessage(chatId,
-            '⚠️ Could not fetch trending data right now.',
-            { reply_markup: mainMenu }
+          const text = trendingChain.floorPriceProvider?.trendingSupported
+            ? '⚠️ Could not fetch trending data right now.'
+            : `⚠️ Trending collections aren't available for *${trendingChain.name}* yet — no trending data provider is integrated for this chain.`
+          await bot.sendMessage(chatId, text,
+            { parse_mode: 'Markdown', reply_markup: mainMenu }
           )
           return
         }
         
-        let text = '🔥 *Trending Collections (24h)*\n\n'
+        let text = `🔥 *Trending Collections (24h) — ${trendingChain.name}*\n\n`
         
         for (let i = 0; i < Math.min(trending.length, 10); i++) {
           const c = trending[i]
@@ -1501,8 +1505,8 @@ initDb().then(async () => {
           const volDisplay = c.volume24h ? c.volume24h.toFixed(2) : '?'
           
           text += `${i + 1}. *${c.name}*\n`
-          text += `   Floor: ${floorDisplay} ETH${floorUsdDisplay} ${changeEmoji} ${change}\n`
-          text += `   Vol: ${volDisplay} ETH\n\n`
+          text += `   Floor: ${floorDisplay} ${trendingChain.nativeSymbol}${floorUsdDisplay} ${changeEmoji} ${change}\n`
+          text += `   Vol: ${volDisplay} ${trendingChain.nativeSymbol}\n\n`
         }
         
         await bot.sendMessage(chatId, text, {
@@ -1631,6 +1635,24 @@ initDb().then(async () => {
       
       state.collection = collection
       state.step = 'alert_price'
+      
+      // Look up the current floor on the chain picked for this alert, so
+      // the user has context before setting a target. Never crashes or
+      // silently shows Ethereum data - an unsupported chain just skips
+      // the line and says so.
+      const alertLookupChain = state.chain || db.getUserChain(userId)
+      let currentFloorLine = ''
+      try {
+        const currentFloorData = await getFloorPrice(collection, alertLookupChain)
+        if (currentFloorData?.unsupported) {
+          currentFloorLine = `\n_${currentFloorData.reason}_\n`
+        } else if (currentFloorData?.floor != null) {
+          state.collectionName = currentFloorData.name || state.collectionName
+          currentFloorLine = `\nCurrent floor: *${Number(currentFloorData.floor).toFixed(4)} ${getChain(alertLookupChain).nativeSymbol}*\n`
+        }
+      } catch (e) {
+        console.error('Current floor lookup error:', e.message)
+      }
       userState.set(userId, state)
       
       // Get ETH price for USD example
@@ -1638,8 +1660,9 @@ initDb().then(async () => {
       const usdExample = ethPrice ? (0.5 * ethPrice).toFixed(0) : 'unavailable'
       
       await bot.sendMessage(chatId,
-        '🔔 *Set Target Price*\n\n' +
-        'Enter the floor price target:\n\n' +
+        '🔔 *Set Target Price*\n' +
+        currentFloorLine +
+        '\nEnter the floor price target:\n\n' +
         '_ETH: 0.5 or 1.25_\n' +
         `_USD: $${usdExample} or $500_\n\n` +
         '_Send /cancel to abort_',

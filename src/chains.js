@@ -28,6 +28,15 @@ const CHAINS = {
       apiStyle: 'etherscan-v2',
       baseUrl: 'https://etherscan.io',
     },
+    // Floor price / trending data source (Phase 5). Ethereum keeps its
+    // original provider chain: Alchemy NFT API first, SimpleHash as a
+    // fallback, CoinGecko for the trending list. `trendingSupported` tells
+    // callers whether src/services/floor.js has a real trending
+    // implementation wired up for this chain at all.
+    floorPriceProvider: {
+      type: 'alchemy-simplehash-ethereum',
+      trendingSupported: true,
+    },
     // Used only as a hint for FCFS timing; not authoritative.
     approxBlockTimeMs: 12_000,
   },
@@ -52,6 +61,27 @@ const CHAINS = {
       apiKeyEnvKey: 'ROBINHOOD_BLOCKSCOUT_API_KEY',
       apiStyle: 'blockscout-etherscan-compat',
       baseUrl: 'https://robinhoodchain.blockscout.com',
+    },
+    // Floor price / trending data source (Phase 5). As of this writing,
+    // neither Alchemy's NFT API nor SimpleHash (SimpleHash's public API was
+    // discontinued in March 2025 after its acquisition by Phantom) list
+    // Robinhood Chain support. OpenSea, however, launched full marketplace
+    // support for Robinhood Chain at chain launch, and its v2 REST API
+    // accepts "robinhood" as a first-class `chain` slug (see
+    // https://docs.opensea.io/reference/get_chains and
+    // https://opensea.io/blog/articles/robinhood-chain-is-live-on-opensea).
+    // src/services/floor.js routes Robinhood Chain floor lookups through
+    // OpenSea's `/v2/chain/{chain}/contract/{address}` (address -> slug) and
+    // `/v2/collections/{slug}/stats` (slug -> floor_price) endpoints, gated
+    // on OPENSEA_API_KEY being configured. There is no confirmed, documented
+    // "trending collections on chain X" endpoint, so `trendingSupported` is
+    // false here - getTrending() returns an empty list for this chain until
+    // a real trending data source is integrated.
+    floorPriceProvider: {
+      type: 'opensea',
+      openseaChainSlug: 'robinhood',
+      apiKeyEnvKey: 'OPENSEA_API_KEY',
+      trendingSupported: false,
     },
     // Rough placeholder - Robinhood Chain batches to Ethereum via EIP-4844
     // blobs and runs a fast L2 execution layer. Tune this in Phase 6/7 once
