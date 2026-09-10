@@ -53,7 +53,18 @@ function validateAddress(value) {
 }
 
 function parseUtcDateTime(value) {
-  const text = String(value ?? '').trim()
+  let text = String(value ?? '').trim()
+
+  // Be forgiving of extra text people commonly paste alongside the value,
+  // e.g. "2026-05-07 12:00 - May 7th at 12pm UTC" (copied from the bot's own
+  // example wording) or a trailing "UTC"/"utc" marker. Only the leading
+  // `YYYY-MM-DD HH:MM` is meaningful; strip anything after it before
+  // validating strictly.
+  const leading = /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/.exec(text)
+  if (leading) {
+    text = leading[1]
+  }
+
   const match = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/.exec(text)
   if (!match) return null
   const [, year, month, day, hour, minute] = match

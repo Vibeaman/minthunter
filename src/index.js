@@ -1640,10 +1640,11 @@ initDb().then(async () => {
       await bot.sendMessage(chatId,
         '⏰ *Schedule Time*\n\n' +
         'When should the mint execute?\n\n' +
-        'Format: `YYYY-MM-DD HH:MM` (UTC)\n\n' +
-        'Examples:\n' +
-        '• `2026-05-07 12:00` - May 7th at 12pm UTC\n' +
-        '• `2026-05-06 23:30` - Today at 11:30pm UTC\n\n' +
+        'Type ONLY the date and time below, in UTC. Do not include "UTC" or any extra words.\n\n' +
+        'Format: `YYYY-MM-DD HH:MM`\n\n' +
+        'Examples (type just the part in backticks):\n' +
+        '• `2026-05-07 12:00` _(May 7th at 12pm UTC)_\n' +
+        '• `2026-05-06 23:30` _(same day at 11:30pm UTC)_\n\n' +
         '_Bot will fire at EXACTLY this time with max speed_',
         { parse_mode: 'Markdown' }
       )
