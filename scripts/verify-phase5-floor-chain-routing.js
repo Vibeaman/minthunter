@@ -79,7 +79,12 @@ async function main() {
   console.log('✅ Ethereum floor lookup (explicit chain="ethereum"): identical behavior')
 
   // 2. Robinhood without OPENSEA_API_KEY configured: clear "unsupported", no crash, no ETH data
+  // Note: `delete` at the top is not enough - floor.js's dotenv.config() re-reads
+  // a real .env from disk at require time and re-populates a deleted varSo
+  // unset again here (getFloorPrice reads the key at call time, thus this is
+  // sufficient) to keep this test hermetic regardless of local .env contents.
   requestedUrls.length = 0
+  delete process.env.OPENSEA_API_KEY
   const robinhoodNoKey = await getFloorPrice(testAddress, 'robinhood')
   assert.equal(requestedUrls.length, 0, 'Should not call OpenSea at all when no API key is configured')
   assert.equal(robinhoodNoKey.floor, null)
