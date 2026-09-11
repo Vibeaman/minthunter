@@ -11,6 +11,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { ethers } = require('ethers')
+const { listChains } = require('../src/chains')
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') })
 
@@ -150,23 +151,23 @@ function operationSummaries(endpoint) {
   )
 }
 
-function buildEndpoints(includeFlashbots) {
-  const endpoints = [
-    ['alchemy', process.env.ALCHEMY_RPC],
-    ['infura', process.env.INFURA_RPC],
-    ['quicknode', process.env.QUICKNODE_RPC],
-  ]
+function buildChainEndpoints(chain, includeFlashbots) {
+  const endpoints = []
 
-  for (const [index, url] of (process.env.BROADCAST_RPCS || '')
+  for (const envKey of chain.rpcEnvKeys || []) {
+    endpoints.push([`${chain.id}:${envKey}`, process.env[envKey]])
+  }
+
+  for (const [index, url] of (process.env[chain.broadcastRpcsEnvKey] || '')
     .split(',')
     .map((value) => value.trim())
     .filter(Boolean)
     .entries()) {
-    endpoints.push([`broadcast-rpc-${index + 1}`, url])
+    endpoints.push([`${chain.id}:broadcast-rpc-${index + 1}`, url])
   }
 
-  if (includeFlashbots && process.env.FLASHBOTS_RPC) {
-    endpoints.push(['flashbots', process.env.FLASHBOTS_RPC.trim()])
+  if (includeFlashbots && chain.flashbotsRpcEnvKey && process.env[chain.flashbotsRpcEnvKey]) {
+    endpoints.push([`${chain.id}:flashbots`, process.env[chain.flashbotsRpcEnvKey].trim()])
   }
 
   const seen = new Set()
@@ -228,13 +229,14 @@ function buildDryRunTransaction(contractConfig) {
   return transaction
 }
 
-async function benchmarkEndpoint(endpointConfig, iterations, timeoutMs, contractConfig) {
+async function benchmarkEndpoint(endpointConfig, iterations, timeoutMs, contractConfig, expectedChainId) {
   // Require the endpoint to answer the chain-ID request; do not trust static metadata.
   const provider = new ethers.JsonRpcProvider(endpointConfig.url)
   const endpoint = {
     label: endpointConfig.label,
     status: 'unavailable',
     chainId: null,
+    expectedChainId: String(expectedChainId),
     operations: {},
   }
 
@@ -249,12 +251,13 @@ async function benchmarkEndpoint(endpointConfig, iterations, timeoutMs, contract
   }
 
   // This single network read both supplies the latency sample and prevents
-  // accidentally benchmarking a non-mainnet endpoint.
+  // accidentally benchmarking an endpoint that serves the wrong chain.
   const detectedNetwork = network.value
   endpoint.chainId = detectedNetwork.chainId.toString()
-  if (detectedNetwork.chainId !== 1n) {
-    endpoint.status = 'non-mainnet'
-    endpoint.error = 'Configured endpoint is not Ethereum mainnet'
+  if (detectedNetwork.chainId !== BigInt(expectedChainId)) {
+
+    endpoint.status = 'chain-mismatch'
+    endpoint.error = `Configured endpoint chain ${detectedNetwork.chainId} does not match expected ${expectedChainId}`
     return { endpoint, provider: null }
   }
 
@@ -365,10 +368,12 @@ function printHumanReport(report) {
     console.log(`  ${endpoint.label}: ${endpoint.status} | ${blockText} | ${prefetchText}${simulationText ? ` | ${simulationText}` : ''}`)
   }
 
-  if (report.race) {
-    console.log('')
-    console.log(`Fastest-provider race: p50/p95 ${report.race.summary.p50Ms ?? '-'} / ${report.race.summary.p95Ms ?? '-'}ms`)
-    console.log(`Race winners: ${Object.entries(report.race.winners).map(([label, count]) => `${label}=${count}`).join(', ') || 'none'}`)
+  if (report.races && Object.keys(report.races).length > 0) {
+    for (const [chainId, race] of Object.entries(report.races)) {
+      console.log('')
+      console.log(`Chain ${chainId} fastest-provider race: p50/p95 ${race.summary.p50Ms ?? '-'} / ${race.summary.p95Ms ?? '-'}ms`)
+      console.log(`  Race winners: ${Object.entries(race.winners).map(([label, count]) => `${label}=${count}`).join(', ') || 'none'}`)
+    }
   }
 
   if (report.outputFile) console.log(`\nJSON report written to: ${report.outputFile}`)
@@ -386,9 +391,14 @@ async function main() {
     : parsePositiveInteger(process.env.BENCHMARK_ITERATIONS, DEFAULT_ITERATIONS, MAX_ITERATIONS)
   const timeoutMs = parsePositiveInteger(process.env.BENCHMARK_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS)
   const includeFlashbots = parseBoolean(process.env.BENCHMARK_INCLUDE_FLASHBOTS, false)
-  const endpointConfigs = buildEndpoints(includeFlashbots)
+  const endpointConfigs = []
+  for (const chain of listChains()) {
+    for (const cfg of buildChainEndpoints(chain, includeFlashbots)) {
+      endpointConfigs.push({ ...cfg, chainId: chain.chainId })
+    }
+  }
   if (endpointConfigs.length === 0) {
-    throw new Error('No RPC endpoints configured. Set ALCHEMY_RPC, INFURA_RPC, QUICKNODE_RPC, or BROADCAST_RPCS.')
+    throw new Error('No RPC endpoints configured. Set the RPC env vars for at least one supported chain.')
   }
 
   const contractConfig = parseContractConfig()
@@ -396,13 +406,14 @@ async function main() {
   const endpointResults = await Promise.all(
     endpointConfigs.map(async (endpointConfig) => {
       try {
-        return await benchmarkEndpoint(endpointConfig, iterations, timeoutMs, contractConfig)
+        return await benchmarkEndpoint(endpointConfig, iterations, timeoutMs, contractConfig, endpointConfig.chainId)
       } catch (error) {
         return {
           endpoint: {
             label: endpointConfig.label,
             status: 'error',
             chainId: null,
+            expectedChainId: String(endpointConfig.chainId || ''),
             operations: {},
             error: safeError(error),
           },
@@ -414,6 +425,15 @@ async function main() {
   const healthyProviders = endpointResults
     .filter(({ endpoint, provider }) => endpoint.status === 'healthy' && provider)
     .map(({ endpoint, provider }) => ({ label: endpoint.label, provider }))
+
+  const providersByChain = new Map()
+  for (const { endpoint, provider } of endpointResults) {
+    if (endpoint.status === 'healthy' && provider) {
+      const key = String(endpoint.chainId)
+      if (!providersByChain.has(key)) providersByChain.set(key, [])
+      providersByChain.get(key).push({ label: endpoint.label, provider })
+    }
+  }
 
   const report = {
     generatedAt: new Date().toISOString(),
@@ -432,11 +452,15 @@ async function main() {
       calldataBytes: contractConfig.mintData ? (contractConfig.mintData.length - 2) / 2 : 0,
     },
     race: null,
+    races: {},
     outputFile: process.env.BENCHMARK_OUTPUT_FILE || null,
   }
 
   if (healthyProviders.length > 0) {
-    report.race = await benchmarkProviderRace(healthyProviders, iterations, timeoutMs)
+    report.races = {}
+    for (const [chainId, providers] of providersByChain) {
+      report.races[chainId] = await benchmarkProviderRace(providers, iterations, timeoutMs)
+    }
   }
 
   report.durationMs = Number((new Date(report.generatedAt).getTime() - new Date(startedAt).getTime()).toFixed(2))

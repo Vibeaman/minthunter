@@ -103,3 +103,14 @@ test('Railway volume database path and transaction costs are calculated safely',
   assert.equal(totalCost, 63_057n)
   assert.throws(() => calculateTransactionCosts({ mintCost: 1n, gasLimit: 1n, gasPrice: -1n }))
 })
+test('wallet import round-trips for every supported chain', () => {
+  const chains = require('../src/chains').listChains()
+  for (const chain of chains) {
+    const chainKey = chain.id
+    const encrypted = encryptPrivateKey(privateKey, `user-${chainKey}`)
+    assert.match(encrypted, /^v2:/)
+    const decrypted = decryptPrivateKey(encrypted, `user-${chainKey}`)
+    assert.equal(validatePrivateKey(decrypted).address, walletAddress)
+    assert.equal(chain.nativeSymbol.length > 0, true)
+  }
+})

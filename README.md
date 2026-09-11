@@ -33,6 +33,8 @@ node scripts/generate-codes.js 30 30
 
 Run the benchmark from the same Railway service or region where MintHunter will run. It measures configured RPC latency, parallel balance/nonce/fee-data reads, and the first-success provider race. It never reads private keys, signs transactions, or submits transactions.
 
+The benchmark runs against every chain defined in `src/chains.js` (Ethereum and Robinhood Chain) using each chain's RPC env vars. Endpoints are verified against their expected chain ID,and a fastest-provider race is reported per chain.
+
 ```bash
 npm run benchmark:fcfs
 ```
