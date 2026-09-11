@@ -121,6 +121,20 @@ function addressUrl(chainKey, address) {
   return `${getChain(chainKey).explorer.baseUrl}/address/${address}`
 }
 
+/**
+ * Collection marketplace links for a chain. OpenSea uses its per-chain slug
+ * (the same slug the floor-price provider uses, falling back to the chain id),
+ * Blur only lists Ethereum collections as of this writing - future chains
+ * that get Blur support should extend this config-driven rather than hardcode.
+ */
+function collectionUrls(chainKey, address) {
+  const chain = getChain(chainKey)
+  const openseaSlug = chain.floorPriceProvider?.openseaChainSlug || chain.id
+  const links = { opensea: `https://opensea.io/assets/${openseaSlug}/${address}` }
+  if (chain.id === 'ethereum') links.blur = `https://blur.io/eth/collection/${address}`
+  return links
+}
+
 module.exports = {
   CHAINS,
   DEFAULT_CHAIN,
@@ -130,4 +144,5 @@ module.exports = {
   getChain,
   txUrl,
   addressUrl,
+  collectionUrls,
 }

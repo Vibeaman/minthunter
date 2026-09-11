@@ -15,7 +15,7 @@ const { getFloorPrice, checkAlerts, getTrending, getEthPrice } = require('./serv
 const { analyzeContract, buildMintData } = require('./services/contract')
 const { ethers } = require('ethers')
 const { calculateTransactionCosts } = require('./transaction-costs')
-const { getChain, isSupportedChain } = require('./chains')
+const { getChain, isSupportedChain, collectionUrls } = require('./chains')
 const {
   isPrivateChat,
   normalizeAccessCode,
@@ -598,6 +598,7 @@ initDb().then(async () => {
       // Store detected mint function if available
       const mintFunctionJson = state.detectedMintFn ? JSON.stringify(state.detectedMintFn) : null
       const jobChain = state.chain || db.getUserChain(userId)
+      const chain = getChain(jobChain)
       
       const result = db.prepare(`
         INSERT INTO mint_jobs 
@@ -625,7 +626,7 @@ initDb().then(async () => {
       const feeUsd = ethPrice ? (parseFloat(FCFS_FEE) * ethPrice).toFixed(2) : 'unavailable'
       
       const feeNote = state.mode !== 'normal' 
-        ? `\n\n💰 Fee: ${FCFS_FEE} ETH (~$${feeUsd})`
+        ? `\n\n💰 Fee: ${FCFS_FEE} ${chain.nativeSymbol} (~$${feeUsd})`
         : ''
       
       // Check if user wants to skip simulation
@@ -703,11 +704,11 @@ initDb().then(async () => {
       await bot.sendMessage(chatId, '🔍 Simulating transaction...')
       
       try {
-        const provider = await getProvider()
-        const network = await provider.getNetwork()
-        if (network.chainId !== 1n) throw new Error('MintHunter currently supports Ethereum mainnet only')
+        const jobChain = job.chain
+        const chain = getChain(jobChain)
+        const provider = await getProvider(jobChain)
+        // getProvider() asserts the configured RPC serves the job chain.
         const ethPrice = await getEthPrice()
-        const detectedFn = job.mint_function ? JSON.parse(job.mint_function) : null
         if (!detectedFn) throw new Error('No verified mint function is available for this job')
         const mintData = buildMintData(detectedFn, 1, wallet.address)
         if (!mintData || mintData === '0x') throw new Error('Mint calldata could not be built safely')
@@ -759,13 +760,13 @@ initDb().then(async () => {
           `⛓ *Chain:* ${getChain(job.chain).name}\n` +
           `⚡ *Mode:* ${job.mint_mode.toUpperCase()}\n\n` +
           `━━━━━━━━━━━━━━━\n\n` +
-          `💰 *Mint Price:* ${mintEth} ETH (~$${mintUsd})\n` +
-          `⛽ *Gas Fee:* ${gasEth} ETH (~$${gasUsd})\n` +
+          `💰 *Mint Price:* ${mintEth} ${chain.nativeSymbol} (~$${mintUsd})\n` +
+          `⛽ *Gas Fee:* ${gasEth} ${chain.nativeSymbol} (~$${gasUsd})\n` +
           `   └ ${gasPriceGwei} gwei \u00d7 ${gasLimit} limit\n` +
-          (fee > 0n ? `🎯 *Bot Fee:* ${feeEth} ETH (~$${feeUsd})\n` : '') +
+          (fee > 0n ? `🎯 *Bot Fee:* ${feeEth} ${chain.nativeSymbol} (~$${feeUsd})\n` : '') +
           `\n━━━━━━━━━━━━━━━\n\n` +
-          `💳 *Total Cost:* ${totalEth} ETH (~$${totalUsd})\n` +
-          `👛 *Your Balance:* ${parseFloat(balanceEth).toFixed(4)} ETH (~$${balanceUsd})\n\n` +
+          `💳 *Total Cost:* ${totalEth} ${chain.nativeSymbol} (~$${totalUsd})\n` +
+          `👛 *Your Balance:* ${parseFloat(balanceEth).toFixed(4)} ${chain.nativeSymbol} (~$${balanceUsd})\n\n` +
           `${statusEmoji} *${statusText}*`,
           {
             parse_mode: 'Markdown',
@@ -836,18 +837,32 @@ initDb().then(async () => {
       bot.sendMessage(chatId, '⏳ Executing mint...').catch((error) => console.error('Execution status notification failed:', error.message))
       
       try {
+        // A wallet tagged for a different chain fails clearly rather than waste
+        // a broadcast on the wrong chain.
+        if (wallet.chain && wallet.chain !== job.chain) {
+          db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', jobId)
+          await bot.sendMessage(chatId,
+            `❌ *Wallet/Chain Mismatch*\n\n` +
+            `This job is for *${getChain(job.chain.name)}* but heg selected wallet is tagged for *${getChain(wallet.chain.name)}*.\n\n` +
+            'Re-create the job with a wallet for the matching chain, or add a wallet for the job chain first.',
+            'Re-create the job with a wallet for the matching chain, or add a wallet for the job chain first.',
+          )
+          return
+        }
+
         // Decrypt private key
         const privateKey = decryptPrivateKey(wallet.encrypted_key, userId.toString())
-        
-        // Get provider
-        // getProvider validates mainnet when selecting or refreshing the cached provider.
-        const provider = await getProvider()
+
+        // Get provider for the job chain (asserts the configured RPC serves that chain)
+        const jobChain = job.chain
+        const chain = getChain(jobChain)
+        const provider = await getProvider(jobChain)
         const signer = new ethers.Wallet(privateKey, provider)
         
         // Start independent RPC reads immediately; local cost/settings work runs in parallel.
         const balancePromise = provider.getBalance(wallet.address)
-        const noncePromise = provider.getTransactionCount(wallet.address, 'pending')
         const feeDataPromise = provider.getFeeData()
+        const noncePromise = provider.getTransactionCount(wallet.address, 'pending') // parallel nonce read
         const baseMintCost = ethers.parseEther(job.mint_price || '0')
         
         // Check user's slippage and gas boost settings
@@ -889,9 +904,9 @@ initDb().then(async () => {
           executingJobs.delete(jobId)
           await bot.sendMessage(chatId,
             `❌ *Insufficient Balance*\n\n` +
-            `Need: ~${ethers.formatEther(totalNeeded)} ETH (~$${needUsd})\n` +
-            `Have: ${ethers.formatEther(balance)} ETH (~$${haveUsd})\n` +
-            `Short: ${shortfall} ETH (~$${shortUsd})`,
+            `Need: ~${ethers.formatEther(totalNeeded)} ${chain.nativeSymbol} (~$${needUsd})\n` +
+            `Have: ${ethers.formatEther(balance)} ${chain.nativeSymbol} (~$${haveUsd})\n` +
+            `Short: ${shortfall} ${chain.nativeSymbol} (~$${shortUsd})`,
             { parse_mode: 'Markdown', reply_markup: mintMenu }
           )
           return
@@ -956,8 +971,8 @@ initDb().then(async () => {
           db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('completed', jobId)
           
           // Generate sell links
-          const openseaLink = `https://opensea.io/assets/ethereum/${job.contract_address}`
-          const blurLink = `https://blur.io/eth/collection/${job.contract_address}`
+          const { opensea, blur: blurLink } = collectionUrls(job.chain, job.contract_address)
+          const openseaLink = opensea
           
           await bot.sendMessage(chatId,
             `✅ *Mint Successful!*\n\n` +
@@ -1327,7 +1342,7 @@ initDb().then(async () => {
 
       // mint_new flow: chain chosen, now ask which wallet to use
       if (state?.step === 'mint_chain') {
-        const wallets = db.prepare('SELECT * FROM wallets WHERE telegram_id = ?').all(userId)
+        const wallets = db.prepare('SELECT * FROM wallets WHERE telegram_id = ?').all(userId).filter(w => w.chain === chain.id)
         if (wallets.length === 0) {
           userState.delete(userId)
           await bot.sendMessage(chatId,
@@ -1352,7 +1367,7 @@ initDb().then(async () => {
 
       // Scheduled mint flow: chain chosen, now ask which wallet to use
       if (state?.step === 'sched_chain') {
-        const wallets = db.prepare('SELECT * FROM wallets WHERE telegram_id = ?').all(userId)
+        const wallets = db.prepare('SELECT * FROM wallets WHERE telegram_id = ?').all(userId).filter(w => w.chain === chain.id)
         if (wallets.length === 0) {
           userState.delete(userId)
           await bot.sendMessage(chatId,
@@ -1812,6 +1827,7 @@ initDb().then(async () => {
 
       // Create a scheduled FCFS job with the verified ABI function attached.
       const jobChain = state.chain || db.getUserChain(userId)
+      const chain = getChain(jobChain)
       const result = db.prepare(`
         INSERT INTO mint_jobs
         (telegram_id, wallet_id, contract_address, mint_function, mint_price, mint_mode, gas_limit, status, scheduled_at, chain)
@@ -1856,7 +1872,7 @@ initDb().then(async () => {
         `⏱ In: ${timeUntil}\n\n` +
         `⚡ Mode: FCFS (Max Speed)\n` +
         `🚀 Gas: Aggressive\n` +
-        `💰 Fee: ${FCFS_FEE} ETH (~$${feeUsd})\n\n` +
+        `💰 Fee: ${FCFS_FEE} ${chain.nativeSymbol} (~$${feeUsd})\n\n` +
         `_Bot will fire at EXACTLY the scheduled time._`,
         {
           parse_mode: 'Markdown',
@@ -2064,6 +2080,7 @@ initDb().then(async () => {
   
   async function executeScheduledMint(job) {
     const chatId = job.telegram_id
+    const chain = getChain(job.chain) // chain ctx
     console.log(`🚀 EXECUTING SCHEDULED MINT #${job.id} NOW!`)
     walletLocks.add(job.wallet_id)
     
@@ -2081,9 +2098,9 @@ initDb().then(async () => {
       // Decrypt key
       const privateKey = decryptPrivateKey(wallet.encrypted_key, job.telegram_id.toString())
       
-      // Get provider
-      // getProvider validates mainnet when selecting or refreshing the cached provider.
-      const provider = await getProvider()
+      // Get provider for the job chain (asserts the configured RPC serves that chain)
+
+      const provider = await getProvider(job.chain)
       const signer = new ethers.Wallet(privateKey, provider)
       
       // Parallelize network data fetching for minimum latency.
@@ -2117,9 +2134,9 @@ initDb().then(async () => {
         await bot.sendMessage(chatId,
           `❌ *Scheduled Mint #${job.id} Failed*\n\n` +
           `Insufficient balance!\n\n` +
-          `💰 Need: ${parseFloat(ethers.formatEther(totalNeeded)).toFixed(4)} ETH (~$${neededUsd})\n` +
-          `👛 Have: ${parseFloat(ethers.formatEther(balance)).toFixed(4)} ETH (~$${balanceUsd})\n` +
-          `📉 Short: ${parseFloat(shortfall).toFixed(4)} ETH (~$${shortUsd})`,
+          `💰 Need: ${parseFloat(ethers.formatEther(totalNeeded)).toFixed(4)} ${getChain(job.chain).nativeSymbol} (~$${neededUsd})\n` +
+          `👛 Have: ${parseFloat(ethers.formatEther(balance)).toFixed(4)} ${chain.nativeSymbol} (~$${balanceUsd})\n` +
+          `📉 Short: ${parseFloat(shortfall).toFixed(4)} ${getChain(job.chain).nativeSymbol} (~$${shortUsd})`,
           { parse_mode: 'Markdown' }
         )
         db.prepare('UPDATE mint_jobs SET status = ? WHERE id = ?').run('failed', job.id)
@@ -2156,7 +2173,7 @@ initDb().then(async () => {
 
       const signedTx = await signer.signTransaction(txData)
       const tx = job.mint_mode === 'fcfs'
-        ? await fcfsBroadcast(signedTx)
+        ? await fcfsBroadcast(signedTx, job.chain)
         : await signer.sendTransaction(txData)
 
       
@@ -2190,8 +2207,8 @@ initDb().then(async () => {
         
         // Generate sell links
         const contractAddr = job.contract_address
-        const openseaLink = `https://opensea.io/assets/ethereum/${contractAddr}`
-        const blurLink = `https://blur.io/eth/collection/${contractAddr}`
+        const { opensea, blur: blurLink } = collectionUrls(job.chain, contractAddr)
+        const openseaLink = opensea
         
         await bot.sendMessage(chatId,
           `✅ *SCHEDULED MINT SUCCESS!*\n\n` +
