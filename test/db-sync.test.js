@@ -33,6 +33,15 @@ test('refreshes a console-created access-code batch before saving bot writes', a
   assert.equal(accessCode.used_by, null)
 })
 
+test('returns a real lastInsertRowid for mint jobs before persistence', () => {
+  const inserted = db.prepare(
+    'INSERT INTO mint_jobs (telegram_id, wallet_id, contract_address, mint_function, mint_price, mint_mode, gas_limit, status, chain) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(99, 1, '0x1111111111111111111111111111111111111111', null, '0', 'normal', 250000, 'pending', 'ethereum')
+  assert.ok(inserted.lastInsertRowid > 0)
+  const job = db.prepare('SELECT id FROM mint_jobs WHERE id = ?').get(inserted.lastInsertRowid)
+  assert.equal(job.id, inserted.lastInsertRowid)
+})
+
 test('reports update changes before persistence and restores interrupted access-code claims', () => {
   const claimUserId = 3
   db.prepare('INSERT INTO users (telegram_id, username, is_authorized) VALUES (?, ?, 0)').run(claimUserId, 'claim-user')

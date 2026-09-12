@@ -5,7 +5,7 @@ function parseCallbackId(data, prefix) {
   const raw = data.slice(prefix.length)
   if (!/^\d+$/.test(raw)) return null
   const id = Number(raw)
-  return Number.isSafeInteger(id) && id > 0 ? id : null
+  return Number.isSafeInteger(id) && id >= 0 ? id : null
 }
 
 function parseEthAmount(value, { allowZero = true } = {}) {

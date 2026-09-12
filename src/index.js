@@ -453,7 +453,7 @@ initDb().then(async () => {
     // Delete wallet
     if (data.startsWith('wallet_delete_')) {
       const walletId = parseCallbackId(data, 'wallet_delete_')
-      if (!walletId) {
+      if (walletId == null) {
         await bot.sendMessage(chatId, '❌ Invalid wallet action.', { reply_markup: walletsMenu })
         return
       }
@@ -515,7 +515,7 @@ initDb().then(async () => {
     // Wallet selected for mint
     if (data.startsWith('mint_wallet_')) {
       const walletId = parseCallbackId(data, 'mint_wallet_')
-      if (!walletId) {
+      if (walletId == null) {
         await bot.sendMessage(chatId, '❌ Invalid wallet selection.', { reply_markup: mintMenu })
         return
       }
@@ -684,7 +684,7 @@ initDb().then(async () => {
     // ========== SIMULATE MINT ==========
     if (data.startsWith('mint_simulate_')) {
       const jobId = parseCallbackId(data, 'mint_simulate_')
-      if (!jobId) {
+      if (jobId == null) {
         await bot.sendMessage(chatId, '❌ Invalid job.', { reply_markup: mintMenu })
         return
       }
@@ -793,7 +793,7 @@ initDb().then(async () => {
     // ========== EXECUTE MINT ==========
     if (data.startsWith('mint_execute_')) {
       const jobId = parseCallbackId(data, 'mint_execute_')
-      if (!jobId) {
+      if (jobId == null) {
         await bot.sendMessage(chatId, '❌ Invalid job.', { reply_markup: mintMenu })
         return
       }
@@ -1023,7 +1023,7 @@ initDb().then(async () => {
     // Cancel mint job
     if (data.startsWith('mint_cancel_')) {
       const jobId = parseCallbackId(data, 'mint_cancel_')
-      if (!jobId) {
+      if (jobId == null) {
         await bot.sendMessage(chatId, '❌ Invalid job.', { reply_markup: mintMenu })
         return
       }
@@ -1062,7 +1062,7 @@ initDb().then(async () => {
     // Scheduled mint - wallet selected
     if (data.startsWith('sched_wallet_')) {
       const walletId = parseCallbackId(data, 'sched_wallet_')
-      if (!walletId) {
+      if (walletId == null) {
         await bot.sendMessage(chatId, '❌ Invalid wallet selection.', { reply_markup: mintMenu })
         return
       }
@@ -1272,7 +1272,7 @@ initDb().then(async () => {
     // Delete alert
     if (data.startsWith('alert_delete_')) {
       const alertId = parseCallbackId(data, 'alert_delete_')
-      if (!alertId) {
+      if (alertId == null) {
         await bot.sendMessage(chatId, '❌ Invalid alert.', { reply_markup: alertsMenu })
         return
       }

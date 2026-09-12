@@ -282,14 +282,17 @@ const dbWrapper = {
       
       db.run(sql, params)
       const changes = db.getRowsModified()
-      save()
-      
+
+      // last_insert_rowid() must be read on this in-memory connection before
+      // save(). save() exports/reloads the file, which resets the connection
+      // rowid to 0 and made Telegram buttons point at Job #0 ("Invalid job").
       let lastId = 0
       if (isInsert) {
         const result = db.exec('SELECT last_insert_rowid() AS id')
-        lastId = result[0]?.values?.[0]?.[0] || 0
+        lastId = Number(result[0]?.values?.[0]?.[0] || 0)
       }
-      
+
+      save()
       return { lastInsertRowid: lastId, changes }
     },
     get: (...params) => {
