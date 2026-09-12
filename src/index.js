@@ -1940,7 +1940,10 @@ initDb().then(async () => {
         await bot.sendMessage(chatId, analysisMsg, { parse_mode: 'Markdown' })
         if (!analysis.verified || !analysis.recommendedMint) {
           userState.delete(userId)
-          await bot.sendMessage(chatId, '❌ Minting was stopped because a verified supported function was not found.', { reply_markup: mintMenu })
+          const stopMsg = analysis.verified
+            ? '❌ Minting was stopped because this verified contract has no public mint/claim function MintHunter can call.\n\nIt may be a proxy, name registrar, or a mint that needs extra arguments (SeaDrop, merkle proof, etc.).'
+            : '❌ Minting was stopped because a verified supported function was not found.'
+          await bot.sendMessage(chatId, stopMsg, { reply_markup: mintMenu })
           return
         }
         

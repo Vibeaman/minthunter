@@ -143,6 +143,68 @@ async function fetchABI(contractAddress, chain = DEFAULT_CHAIN) {
   throw err
 }
 
+async function fetchSourceCode(contractAddress, chainConfig) {
+  const apiStyle = chainConfig.explorer.apiStyle
+  let url
+
+  if (apiStyle === 'etherscan-v2') {
+    const apiKey = process.env[chainConfig.explorer.apiKeyEnvKey] || ETHERSCAN_API_KEY
+    if (!apiKey) return null
+    url = `${chainConfig.explorer.apiUrl}?chainid=${chainConfig.chainId}&module=contract&action=getsourcecode&address=${contractAddress}&apikey=${apiKey}`
+  } else if (apiStyle === 'blockscout-etherscan-compat') {
+    const apiKey = process.env[chainConfig.explorer.apiKeyEnvKey]
+    const apiKeyParam = apiKey ? `&apikey=${apiKey}` : ''
+    url = `${chainConfig.explorer.apiUrl}?module=contract&action=getsourcecode&address=${contractAddress}${apiKeyParam}`
+  } else {
+    return null
+  }
+
+  const response = await axios.get(url, { timeout: 10000, headers: EXPLORER_HTTP_HEADERS })
+  const result = response.data?.result
+  return Array.isArray(result) && result[0] ? result[0] : null
+}
+
+function implementationFromSource(source) {
+  if (!source) return null
+  const candidates = [
+    source.ImplementationAddress,
+    Array.isArray(source.ImplementationAddresses) ? source.ImplementationAddresses[0] : null,
+    source.Implementation,
+  ]
+  for (const value of candidates) {
+    if (typeof value !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(value)) continue
+    try {
+      const address = ethers.getAddress(value)
+      if (address !== ethers.ZeroAddress) return address
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
+async function resolveMintAbi(contractAddress, chain, proxyAbi) {
+  if (findMintFunctions(proxyAbi).length > 0) return { abi: proxyAbi, implementation: null }
+
+  try {
+    const chainConfig = getChain(chain)
+    const source = await fetchSourceCode(contractAddress, chainConfig)
+    const implementation = implementationFromSource(source)
+    if (!implementation || implementation.toLowerCase() === contractAddress.toLowerCase()) {
+      return { abi: proxyAbi, implementation: null }
+    }
+
+    const implementationAbi = await fetchABI(implementation, chain)
+    if (Array.isArray(implementationAbi) && implementationAbi.length > 0) {
+      return { abi: implementationAbi, implementation }
+    }
+  } catch (error) {
+    console.error('Proxy implementation ABI follow failed:', error.message)
+  }
+
+  return { abi: proxyAbi, implementation: null }
+}
+
 /**
  * Find mint functions from ABI
  */
@@ -344,6 +406,13 @@ async function analyzeContract(contractAddress, provider, chain = DEFAULT_CHAIN)
     }
     
     result.verified = true
+
+    const resolved = await resolveMintAbi(contractAddress, chain, abi)
+    abi = resolved.abi
+    if (resolved.implementation) {
+      result.implementation = resolved.implementation
+      console.log(`Followed proxy implementation: ${resolved.implementation}`)
+    }
     
     // Find mint functions
     result.mintFunctions = findMintFunctions(abi)
