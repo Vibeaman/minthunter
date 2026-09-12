@@ -709,6 +709,7 @@ initDb().then(async () => {
         const provider = await getProvider(jobChain)
         // getProvider() asserts the configured RPC serves the job chain.
         const ethPrice = await getEthPrice()
+        const detectedFn = job.mint_function ? JSON.parse(job.mint_function) : null
         if (!detectedFn) throw new Error('No verified mint function is available for this job')
         const mintData = buildMintData(detectedFn, 1, wallet.address)
         if (!mintData || mintData === '0x') throw new Error('Mint calldata could not be built safely')
