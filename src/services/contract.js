@@ -11,6 +11,17 @@ const { getChain, DEFAULT_CHAIN } = require('../chains')
 
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || ''
 
+// Robinhood Chain's Blockscout sits behind Cloudflare. Requests without a
+// browser-like User-Agent (axios's default is "axios/1.x") get a 403
+// challenge page instead of JSON. Etherscan is fine either way; send the
+// same headers on both so explorer calls stay consistent.
+const EXPLORER_HTTP_HEADERS = {
+  // Cloudflare on robinhoodchain.blockscout.com challenges non-browser UAs
+  // (including axios's default and custom bot strings) with HTTP 403.
+  'User-Agent': 'Mozilla/5.0 (compatible; MintHunter/1.0)',
+  Accept: 'application/json',
+}
+
 // Common mint function patterns to look for
 const MINT_PATTERNS = [
   'mint', 'claim', 'buy', 'purchase', 'freemint', 'publicmint', 
@@ -70,7 +81,7 @@ async function fetchABIFromEtherscanV2(contractAddress, chainConfig) {
 
   try {
     const url = `${chainConfig.explorer.apiUrl}?chainid=${chainConfig.chainId}&module=contract&action=getabi&address=${contractAddress}&apikey=${apiKey}`
-    const response = await axios.get(url, { timeout: 10000 })
+    const response = await axios.get(url, { timeout: 10000, headers: EXPLORER_HTTP_HEADERS })
     return parseGetAbiResponse(response, 'Etherscan')
   } catch (error) {
     if (error.code === 'INVALID_API_KEY' || error.code === 'RATE_LIMITED') {
@@ -95,7 +106,7 @@ async function fetchABIFromBlockscoutCompat(contractAddress, chainConfig) {
 
   try {
     const url = `${chainConfig.explorer.apiUrl}?module=contract&action=getabi&address=${contractAddress}${apiKeyParam}`
-    const response = await axios.get(url, { timeout: 10000 })
+    const response = await axios.get(url, { timeout: 10000, headers: EXPLORER_HTTP_HEADERS })
     return parseGetAbiResponse(response, 'Blockscout')
   } catch (error) {
     if (error.code === 'INVALID_API_KEY' || error.code === 'RATE_LIMITED') {

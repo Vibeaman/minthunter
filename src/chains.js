@@ -57,6 +57,7 @@ const CHAINS = {
     explorer: {
       // Blockscout's Etherscan-compatible API. Works keyless at low volume;
       // set ROBINHOOD_BLOCKSCOUT_API_KEY to raise rate limits if needed.
+      // Cloudflare on this host 403s requests without a User-Agent header.
       apiUrl: 'https://robinhoodchain.blockscout.com/api',
       apiKeyEnvKey: 'ROBINHOOD_BLOCKSCOUT_API_KEY',
       apiStyle: 'blockscout-etherscan-compat',
