@@ -356,7 +356,14 @@ initDb().then(async () => {
         `• Tap 🔍 *Simulate* first to check the transaction will succeed on-chain, without spending anything.\n` +
         `• When ready, tap 🚀 *EXECUTE NOW* to send the real transaction. This always requires your explicit confirmation — MintHunter never mints automatically without you pressing Execute.\n\n` +
         `⏰ *Schedule Mint* lets you queue a job to fire automatically at a specific time (e.g. right when a mint opens).\n\n` +
-        `📋 Check *Pending Jobs* for mints waiting to run, and *Completed* for your mint history.`,
+        `📋 Check *Pending Jobs* for mints waiting to run, and *Completed* for your mint history.\n\n` +
+        `⚠️ *What MintHunter can mint*\n` +
+        `It only auto-builds simple public mint/claim functions on the NFT contract (quantity and/or recipient). Simulate first — if the collection reverts, Execute will fail too.\n\n` +
+        `❌ *What it cannot mint*\n` +
+        `• OpenSea SeaDrop collections (OnlyAllowedSeaDrop — minting goes through SeaDrop, not the NFT itself)\n` +
+        `• Merkle / allowlist mints that need a proof\n` +
+        `• Name registrars and other non-mint contracts\n\n` +
+        `An OpenSea API key is only used for *floor prices* on Robinhood Chain. It does not let MintHunter mint through OpenSea or SeaDrop.`,
         {
           chat_id: chatId,
           message_id: query.message.message_id,
@@ -492,7 +499,8 @@ initDb().then(async () => {
         '⚡ *Minting*\n\n' +
         'Create mint jobs to auto-mint NFTs.\n\n' +
         '• *FCFS* - Broadcast through configured RPCs\n' +
-        '• *Normal* - Standard verified transaction',
+        '• *Normal* - Standard verified transaction\n\n' +
+        '_Works for simple public mint/claim functions. SeaDrop, merkle proofs, and OpenSea checkout are not supported. OpenSea API keys are for floor prices only._',
         {
           chat_id: chatId,
           message_id: query.message.message_id,
