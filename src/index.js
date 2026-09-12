@@ -35,7 +35,22 @@ if (!FEE_WALLET || !FCFS_FEE) {
 }
 
 // Common error messages decoder
+const CUSTOM_ERROR_SELECTORS = {
+  '0x15e26ff3': 'OnlyAllowedSeaDrop — this NFT only mints through SeaDrop, not a direct mint() on the collection',
+}
+
+function extractCustomErrorSelector(error) {
+  const text = `${error?.data || ''} ${error?.message || ''} ${error?.shortMessage || ''} ${error?.info?.error?.data || ''}`
+  const match = /0x([a-fA-F0-9]{8})/.exec(text)
+  return match ? `0x${match[1].toLowerCase()}` : null
+}
+
 function decodeError(error) {
+  const selector = extractCustomErrorSelector(error)
+  if (selector && CUSTOM_ERROR_SELECTORS[selector]) {
+    return `🚫 ${CUSTOM_ERROR_SELECTORS[selector]}`
+  }
+
   const msg = error?.message?.toLowerCase() || error?.toString()?.toLowerCase() || ''
   const reason = error?.reason?.toLowerCase() || ''
   
@@ -784,7 +799,7 @@ initDb().then(async () => {
       } catch (e) {
         console.error('Simulation error:', e)
         await bot.sendMessage(chatId,
-          `❌ Simulation failed: ${e.message?.slice(0, 100)}`,
+          `❌ Simulation failed: ${decodeError(e)}`,
           { reply_markup: mintMenu }
         )
       }
